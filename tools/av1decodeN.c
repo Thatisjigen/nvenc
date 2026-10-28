@@ -8,6 +8,15 @@
 #include <string.h>
 
 static int gB = 1, gBD = 8;
+// DEC_MD5=1 prints the MD5 of each shown frame's I420 output, as libvpx's / libaom's test vector .md5 files list them
+#include <CommonCrypto/CommonDigest.h>
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+static void print_md5(int shown, const uint8_t *p, size_t n)
+{
+    if (!getenv("DEC_MD5")) return;
+    unsigned char m[CC_MD5_DIGEST_LENGTH]; CC_MD5(p, (CC_LONG)n, m);
+    printf("md5 %d ", shown); for (int i = 0; i < CC_MD5_DIGEST_LENGTH; i++) printf("%02x", m[i]); printf("\n");
+}
 static double psnr(const uint8_t *a, const uint8_t *b, size_t n)
 {
     double se = 0;
@@ -68,6 +77,7 @@ int main(int argc, char **argv)
         const size_t full = ((size_t)w * h + 2 * (size_t)cw * ch) * (size_t)gB;
         if (full > cap) { cap = full; out = realloc(out, cap); ref = realloc(ref, cap); }
         av1dec_read_i420(&d, d.cur_surf, out, w, h);
+        print_md5(shown, out, fs);
         if (verbose) {   // what the engine wrote into the shown surface
             size_t ln = 0, cn = 0; const uint8_t *L = d.luma[d.cur_surf].cpu, *C = d.chroma[d.cur_surf].cpu;
             for (size_t i = 0; i < d.luma[d.cur_surf].size; i++) ln += L[i] != 0;
