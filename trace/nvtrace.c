@@ -7,6 +7,8 @@
 //     subchannel), and at every NVENC EXECUTE dumps the method state, the memory behind each address, and the
 //     picture setup buffer.
 //   DYLD_INSERT_LIBRARIES=~/nvenc-dev/nvtrace.dylib NVTRACE_OUT=/tmp/t.log ./vttest hw avc1 256 128 3
+// NVDEC channels too (class 0x..b0): at every EXECUTE the method state by name (nvdec_names.h, generated from
+// clc9b0.h), the memory behind each address and the picture setup; NVTRACE_DIR dumps every buffer but the pictures.
 #include <IOKit/IOKitLib.h>
 #include <dlfcn.h>
 #include <pthread.h>
@@ -24,6 +26,7 @@
 #include "alloc/alloc_channel.h"
 #include "class/cl2080_notification.h"
 #include "class/clc56f.h"
+#include "nvdec_names.h"
 
 #define SEL_ESC 1
 #define SEL_BINDFD 3
@@ -160,6 +163,32 @@ static void on_execute(Chan *c, NvU32 data)
     }
 }
 
+// NVDEC (0x..b0) state at EXECUTE; addresses are the methods named *_OFFSET*, all shifted by 8
+static void on_execute_dec(Chan *c, NvU32 data)
+{
+    c->execs++;
+    L("  ==== NVDEC EXECUTE #%d (0x%x) on channel 0x%08x, state:\n", c->execs, data, c->h);
+    const char *dir = getenv("NVTRACE_DIR");
+    for (int i = 0; i < 0x1400 / 4; i++) {
+        if (!c->set[i]) continue;
+        const NvU32 m = (NvU32)i * 4, v = c->state[i];
+        const char *n = nvdec_name(m);
+        L("    %03x %-36s 0x%08x", m, n, v);
+        const int addr = strstr(n, "OFFSET") != NULL;
+        if (addr) { L("  -> 0x%llx ", (unsigned long long)v << 8); mem_desc((NvU64)v << 8); }
+        L("\n");
+        if (!addr || !dir || (m >= 0x430 && m < 0x4b8)) continue;   // the picture surfaces are not dumped
+        NvU64 va = (NvU64)v << 8; Mem *mm = mem_by_gpu(va); void *b = va2cpu(va);
+        if (!mm || !b) continue;
+        NvU64 len = mm->gpuLen - (va - mm->gpu); if (len > (16 << 20)) len = 16 << 20;
+        char path[600]; snprintf(path, sizeof path, "%s/dec%d-%03x.bin", dir, c->execs, m);
+        FILE *f = fopen(path, "wb"); if (f) { fwrite(b, 1, len, f); fclose(f); L("    dumped %s (0x%llx bytes)\n", path, (unsigned long long)len); }
+    }
+    void *ps = c->set[0x404 / 4] ? va2cpu((NvU64)c->state[0x404 / 4] << 8) : NULL;
+    if (ps) { L("    picture setup (8 KB, zero rows skipped):\n"); hexi("      ", ps, 0x2000); }
+    else L("    picture setup not CPU-visible\n");
+}
+
 static void decode_push(Chan *c, const NvU32 *p, NvU32 n)
 {
     for (NvU32 i = 0; i < n;) {
@@ -170,9 +199,9 @@ static void decode_push(Chan *c, const NvU32 *p, NvU32 n)
             NvU32 d = op == 4 ? (h >> 16) & 0x1fff : p[i++];
             NvU32 m = op == 1 ? mthd + 4 * k : op == 5 && k ? mthd + 4 : mthd;
             if (m == 0) c->subclass[sub] = d;
-            int enc = (c->subclass[sub] & 0xff) == 0xb7;
-            L("    sc%u %03x %-28s 0x%08x%s\n", sub, m, enc || m < 0x100 ? nvenc_name(m) : "", d, op == 4 ? " (immd)" : "");
-            if (enc && m < 0x1400) { c->state[m / 4] = d; c->set[m / 4] = 1; if (m == 0x300) on_execute(c, d); }
+            int enc = (c->subclass[sub] & 0xff) == 0xb7, dec = (c->subclass[sub] & 0xff) == 0xb0;
+            L("    sc%u %03x %-28s 0x%08x%s\n", sub, m, dec ? nvdec_name(m) : enc || m < 0x100 ? nvenc_name(m) : "", d, op == 4 ? " (immd)" : "");
+            if ((enc || dec) && m < 0x1400) { c->state[m / 4] = d; c->set[m / 4] = 1; if (m == 0x300) { if (dec) on_execute_dec(c, d); else on_execute(c, d); } }
         }
     }
 }
@@ -238,10 +267,11 @@ static void log_alloc(const char *who, NvHandle client, NvHandle parent, NvHandl
           (unsigned long long)ch->userdOffset[0], ch->engineType, ch->hVASpace, ch->hContextShare);
         hexi("      ", pp, psz > 512 ? 512 : psz);
         NvU32 et = ch->engineType;
-        if (!status && (et == NV2080_ENGINE_TYPE_NVENC0 || et == NV2080_ENGINE_TYPE_NVENC1 || et == NV2080_ENGINE_TYPE_NVENC2) && gNChan < 16) {
+        if (!status && (et == NV2080_ENGINE_TYPE_NVENC0 || et == NV2080_ENGINE_TYPE_NVENC1 || et == NV2080_ENGINE_TYPE_NVENC2 ||
+                        et == NV2080_ENGINE_TYPE_NVDEC0) && gNChan < 16) {
             Chan *c = &gChan[gNChan++]; memset(c, 0, sizeof *c);
             c->client = client; c->h = obj; c->engineType = et; c->gpfifoVa = ch->gpFifoOffset; c->entries = ch->gpFifoEntries;
-            L("      -> following this NVENC channel's GPFIFO\n");
+            L("      -> following this %s channel's GPFIFO\n", et == NV2080_ENGINE_TYPE_NVDEC0 ? "NVDEC" : "NVENC");
             start_poller();
         }
     } else if (psz) {
