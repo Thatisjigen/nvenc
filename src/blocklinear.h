@@ -19,6 +19,14 @@ size_t nvenc_in_plane_size(size_t pitch, size_t rows);
 void nvenc_in_tile_plane(uint8_t *dst, const uint8_t *src, size_t src_stride, size_t width, size_t rows, size_t pitch);
 // the inverse: a plane in that layout (pitch) to pitch-linear dst (dst_stride); NVDEC writes the same layout (M8)
 void nvenc_in_untile_plane(uint8_t *dst, size_t dst_stride, const uint8_t *src, size_t width, size_t rows, size_t pitch);
+// NVDEC's output for decoders: the layout above is Turing's 2D colour GOB (Mesa nil TuringColor2D) with blocks of two
+// GOBs. On Blackwell (NVDEC 0xcfb0) the H.264 decoder writes the new GOBs for 1- and 2-byte texels (nil Blackwell8Bit /
+// Blackwell16Bit: luma and NV12 chroma, measured on the RTX 5050), while HEVC keeps Turing's. bpp = the plane's
+// bytes per texel (luma 1 or 2, interleaved chroma 2 or 4); 4 keeps Turing's GOB. Set by rm_class from the NVDEC class;
+// NVDEC_GOB=turing | blackwell overrides it.
+extern int nvdec_gob_blackwell;
+size_t nvdec_offset(size_t x, size_t y, size_t pitch, unsigned bpp);
+void nvdec_untile_plane(uint8_t *dst, size_t dst_stride, const uint8_t *src, size_t width, size_t rows, size_t pitch, unsigned bpp);
 // BGRA (8-bit, 4 bytes per pixel) -> NV12 in NVENC's input layout, BT.709 video range, 2x2 chroma average; converted per
 // 16-row band in a cache-sized buffer, bands over two threads. dst_luma / dst_chroma: the two planes (pitch bytes per row).
 void nvenc_in_tile_bgra(uint8_t *dst_luma, uint8_t *dst_chroma, const uint8_t *src, size_t src_stride, size_t width, size_t rows, size_t pitch);

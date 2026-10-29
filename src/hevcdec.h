@@ -16,6 +16,7 @@ typedef struct {
     int bit_depth, bps, chroma_format;
     size_t pitch;                   // bytes
     RmMem setup, bs, scaling, tiles, filter, coloc, intra, slinfo, status, sem;
+    RmMem bw4dc;                    // Blackwell (NVDEC 0xcfb0): the buffer of method 0x4dc
     size_t colmv_size, flt_sao, flt_bsd, flt_above, flt_sao_above, flt_edge;
     RmMem luma[HEVC_SURFACES], chroma[HEVC_SURFACES];
     // per surface
@@ -27,6 +28,7 @@ typedef struct {
     NvU32 semval;
     bool verbose;
     bool turing;                    // NVDEC 0xc4b0 (GTX 1650): no SET_INTRA_TOP_BUF_OFFSET
+    bool blackwell;                 // NVDEC 0xcfb0 (RTX 50): method 0x4dc and a setup word past Ada's struct
     // the picture just decoded
     int cur_surf, cur_poc, cur_w, cur_h, cur_crop[4];   // crop: left, right, top, bottom (luma samples)
     bool cur_output;                // pic_output_flag (and not a skipped RASL picture)

@@ -49,19 +49,38 @@ void h264dec_close(H264Dec *d)
 
 void h264dec_release(H264Dec *d, int surf) { if (surf >= 0 && surf < DEC_SURFACES) d->busy[surf] = false; }
 
+// Diagnostics: NVDEC_DUMP_RAW=<prefix> writes the first picture read as the engine left it: <prefix>.luma and
+// <prefix>.chroma (pitch x rows rounded to 16), and <prefix>.txt with width, height and pitch
+static void dump_raw(const H264Dec *d, int surf, unsigned w, unsigned h)
+{
+    static bool done;
+    const char *p = getenv("NVDEC_DUMP_RAW");
+    if (!p || done) return;
+    done = true;
+    char path[1024]; FILE *f;
+    snprintf(path, sizeof path, "%s.luma", p);
+    if ((f = fopen(path, "wb"))) { fwrite(d->luma[surf].cpu, 1, nvenc_in_plane_size(d->pitch, h), f); fclose(f); }
+    snprintf(path, sizeof path, "%s.chroma", p);
+    if ((f = fopen(path, "wb"))) { fwrite(d->chroma[surf].cpu, 1, nvenc_in_plane_size(d->pitch, (h + 1) / 2), f); fclose(f); }
+    snprintf(path, sizeof path, "%s.txt", p);
+    if ((f = fopen(path, "w"))) { fprintf(f, "width %u height %u pitch %zu x0 %d y0 %d gob %s\n", w, h, d->pitch, d->x0[surf], d->y0[surf],
+                                          nvdec_gob_blackwell ? "blackwell" : "turing"); fclose(f); }
+}
+
 void h264dec_read_nv12(H264Dec *d, int surf, uint8_t *y, size_t ystride, uint8_t *uv, size_t uvstride, unsigned w, unsigned h)
 {
     const unsigned x0 = (unsigned)d->x0[surf], y0 = (unsigned)d->y0[surf];
+    dump_raw(d, surf, w, h);
     if (!x0 && !y0) {
-        nvenc_in_untile_plane(y, ystride, d->luma[surf].cpu, w, h, d->pitch);
-        nvenc_in_untile_plane(uv, uvstride, d->chroma[surf].cpu, w, h / 2, d->pitch);
+        nvdec_untile_plane(y, ystride, d->luma[surf].cpu, w, h, d->pitch, 1);
+        nvdec_untile_plane(uv, uvstride, d->chroma[surf].cpu, w, h / 2, d->pitch, 2);
         return;
     }
     // cropped on the left / top (rare): sample by sample
     for (unsigned r = 0; r < h; r++) for (unsigned x = 0; x < w; x++)
-        y[r * ystride + x] = ((const uint8_t *)d->luma[surf].cpu)[nvenc_in_offset(x0 + x, y0 + r, d->pitch)];
+        y[r * ystride + x] = ((const uint8_t *)d->luma[surf].cpu)[nvdec_offset(x0 + x, y0 + r, d->pitch, 1)];
     for (unsigned r = 0; r < h / 2; r++) for (unsigned x = 0; x < w; x++)
-        uv[r * uvstride + x] = ((const uint8_t *)d->chroma[surf].cpu)[nvenc_in_offset((x0 & ~1u) + x, y0 / 2 + r, d->pitch)];
+        uv[r * uvstride + x] = ((const uint8_t *)d->chroma[surf].cpu)[nvdec_offset((x0 & ~1u) + x, y0 / 2 + r, d->pitch, 2)];
 }
 
 void h264dec_read_i420(H264Dec *d, int surf, uint8_t *dst, unsigned w, unsigned h)
@@ -69,9 +88,9 @@ void h264dec_read_i420(H264Dec *d, int surf, uint8_t *dst, unsigned w, unsigned 
     const uint8_t *L = d->luma[surf].cpu, *C = d->chroma[surf].cpu;
     uint8_t *u = dst + (size_t)w * h, *v = u + (size_t)w * h / 4;
     const unsigned x0 = (unsigned)d->x0[surf], y0 = (unsigned)d->y0[surf];
-    for (unsigned y = 0; y < h; y++) for (unsigned x = 0; x < w; x++) dst[(size_t)y * w + x] = L[nvenc_in_offset(x0 + x, y0 + y, d->pitch)];
+    for (unsigned y = 0; y < h; y++) for (unsigned x = 0; x < w; x++) dst[(size_t)y * w + x] = L[nvdec_offset(x0 + x, y0 + y, d->pitch, 1)];
     for (unsigned y = 0; y < h / 2; y++) for (unsigned x = 0; x < w; x++) {
-        uint8_t c = C[nvenc_in_offset((x0 & ~1u) + x, y0 / 2 + y, d->pitch)];
+        uint8_t c = C[nvdec_offset((x0 & ~1u) + x, y0 / 2 + y, d->pitch, 2)];
         if (x & 1) v[(size_t)y * (w / 2) + x / 2] = c; else u[(size_t)y * (w / 2) + x / 2] = c;
     }
 }

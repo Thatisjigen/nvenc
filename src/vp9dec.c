@@ -20,6 +20,7 @@ int vp9dec_open(Vp9Dec *d, Rm *rm, unsigned maxW, unsigned maxH, int bit_depth)
     d->rm = rm; d->maxW = (maxW + 63) & ~63u; d->maxH = (maxH + 63) & ~63u;
     d->bit_depth = bit_depth; d->bps = bit_depth > 8 ? 2 : 1;
     d->turing = rm_class(rm, RM_CLS_NVDEC) == 0xc4b0;
+    d->blackwell = rm_class(rm, RM_CLS_NVDEC) == 0xcfb0;
     d->pitch = (size_t)d->maxW * (size_t)d->bps;
     for (int i = 0; i < 8; i++) d->ref[i] = -1;
     vp9_init(&d->st);
@@ -39,8 +40,11 @@ int vp9dec_open(Vp9Dec *d, Rm *rm, unsigned maxW, unsigned maxH, int bit_depth)
         { &d->setup, 0x2000 }, { &d->bs, bsCap }, { &d->probs, sizeof(nvdec_vp9EntropyProbs_t) },
         { &d->counts, sizeof(nvdec_vp9EntropyCounts_t) }, { &d->seg[0], sbs * GIP_ASIC_VP9_CTB_SEG_SIZE },
         { &d->seg[1], sbs * GIP_ASIC_VP9_CTB_SEG_SIZE }, { &d->tiles, 0x1000 }, { &d->colmv[0], sbs * 1024 },
-        { &d->colmv[1], sbs * 1024 }, { &d->filter, flt }, { &d->intra, (size_t)d->maxW * 8 * (size_t)d->bps }, { &d->status, 0x1000 }, { &d->sem, 0x1000 } };
+        { &d->colmv[1], sbs * 1024 }, { &d->filter, flt }, { &d->intra, (size_t)d->maxW * 8 * (size_t)d->bps }, { &d->status, 0x1000 }, { &d->sem, 0x1000 },
+        // as for HEVC, Blackwell's engine stops (no completion) past the smallest pictures without method 0x4dc
+        { &d->bw4dc, d->blackwell ? ((size_t)1 << 20) + (size_t)d->maxW * 256 * (size_t)d->bps : 0 } };
     for (size_t i = 0; i < sizeof b / sizeof b[0]; i++) {
+        if (!b[i].size) continue;
         if (rm_mem_alloc(rm, b[i].m, (b[i].size + 0xfff) & ~(size_t)0xfff, 0x1000, true, true, true)) { fprintf(stderr, "vp9dec: alloc failed\n"); return -1; }
         memset(b[i].m->cpu, 0, b[i].m->size);
     }
@@ -56,7 +60,7 @@ void vp9dec_close(Vp9Dec *d)
 {
     chan_destroy(&d->chan);
     RmMem *m[] = { &d->setup, &d->bs, &d->probs, &d->counts, &d->seg[0], &d->seg[1], &d->tiles, &d->colmv[0], &d->colmv[1],
-                   &d->filter, &d->intra, &d->status, &d->sem };
+                   &d->filter, &d->intra, &d->status, &d->sem, &d->bw4dc };
     for (size_t i = 0; i < sizeof m / sizeof m[0]; i++) rm_mem_free(d->rm, m[i]);
     for (int i = 0; i < VP9_SURFACES; i++) { rm_mem_free(d->rm, &d->luma[i]); rm_mem_free(d->rm, &d->chroma[i]); }
 }
@@ -269,6 +273,13 @@ int vp9dec_frame(Vp9Dec *d, const uint8_t *buf, size_t n)
     for (int i = 0; i < 2; i++) ps->mbModeLfDelta[i] = (char)d->st.lf_mode_deltas[i];
     ps->v1.Vp9FltAboveOffset = (unsigned)(d->flt_above >> 8);
     ps->v1.bit_depth = (unsigned)f->bit_depth;
+    // Found on the RTX 5050 against libvpx's test vectors (no Blackwell VP9 client to observe): the word 0x10 just past
+    // Ada's struct + 8, as in HEVC's setup (without it inter pictures with tile columns come out wrong), and reserved1[2] = 3
+    // for 10-bit (HEVC has the 3 in reserved7; without it 10-bit inter pictures are wrong; 1 or 2 do not do)
+    if (d->blackwell) {
+        ((NvU32 *)ps)[(sizeof *ps + 8) / 4] = 0x10;
+        if (f->bit_depth > 8) ps->reserved1[2] = 3;
+    }
 
     Chan *c = &d->chan;
     chan_rewind(c);
@@ -291,6 +302,7 @@ int vp9dec_frame(Vp9Dec *d, const uint8_t *buf, size_t n)
     // sends none (docs/traces/vp9dec-gtx1650-linux); given one, that engine used the buffer as 32 bytes per superblock, decoded
     // frames that keep the segmentation map as if segmentation were off and faulted when the buffer was smaller than that
     if (!d->turing) chan_mthd(c, 0, NVC9B0_SET_INTRA_TOP_BUF_OFFSET, 1, hi(d->intra.gpu));
+    if (d->blackwell) chan_mthd(c, 0, 0x4dc, 1, hi(d->bw4dc.gpu));   // see vp9dec_open
     const int sfc[4] = { rs[0], rs[1], rs[2], surf };          // VP9_LAST/GOLDEN/ALTREF/CURR_FRAME_SFC
     for (int i = 0; i < 4; i++) {
         chan_mthd(c, 0, NVC9B0_SET_PICTURE_LUMA_OFFSET0 + 4 * (NvU32)i, 1, hi(d->luma[sfc[i]].gpu));

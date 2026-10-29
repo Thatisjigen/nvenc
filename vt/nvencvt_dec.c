@@ -940,6 +940,9 @@ OSStatus NVDecVT_Register(int rating)
     extern int gNvencvtGpu;   // vt/nvencvt.c: 1 Ada, 2 TU117 (GTX 1650: NVDEC 0xc4b0 has no AV1), 3 GA10x (RTX 30)
     const bool ampere = gNvencvtGpu == 3;
     const bool av1Vp9Only = ampere && !getenv("NVENCVT_AMPERE_ALL_DEC");
+    // on GB20x (4, NVDEC 0xcfb0) H.264, HEVC, VP9 and 8-bit AV1 are checked (bit-exact on the RTX 5050); MPEG may need
+    // what the others did there (method 0x4dc, a setup word past Ada's struct) or Blackwell's GOBs, so it stays unregistered
+    const bool blackwell = gNvencvtGpu == 4;
     typedef OSStatus (*RegFn)(FourCharCode, CFDictionaryRef, void *);
     RegFn reg = (RegFn)dlsym(RTLD_DEFAULT, "VTRegisterVideoDecoderWithInfo");
     if (!reg) { DLOG("VTRegisterVideoDecoderWithInfo not found"); return kVTCouldNotFindVideoDecoderErr; }
@@ -978,8 +981,8 @@ OSStatus NVDecVT_Register(int rating)
     // a decoder that registers on a card without AV1 would take the session away from Apple's own decoder and then fail.
     // Ada's and Turing's class is known from the card (the PCI device ID), so RM is asked only for GA10x and for cards the
     // registry does not name - and RM answering 0 (no driver) means no AV1 decoder at all.
-    const NvU32 nvcls = gNvencvtGpu == 1 ? 0xc9b0 : gNvencvtGpu == 2 ? 0xc4b0 : nvdec_class();
-    const bool hasAv1 = nvcls == 0xc7b0 || nvcls == 0xc9b0;
+    const NvU32 nvcls = gNvencvtGpu == 1 ? 0xc9b0 : gNvencvtGpu == 2 ? 0xc4b0 : gNvencvtGpu == 4 ? 0xcfb0 : nvdec_class();   // 4: GB20x
+    const bool hasAv1 = nvcls == 0xc7b0 || nvcls == 0xc9b0 || nvcls == 0xcfb0;   // 0xcfb0: Blackwell, 8-bit only
     DLOG("NVDEC class 0x%x%s", nvcls, hasAv1 ? " (AV1)" : " (no AV1)");
     if (!getenv("NVENCVT_NO_AV1DEC") && hasAv1) {   // AV1 likewise (NVENCVT_NO_AV1DEC=1 leaves it out)
         const void *va[] = { CFSTR(DECODER_ID_AV1), CFSTR("NVDEC - AV1 - mickys/nvenc"), nr, kCFBooleanTrue };
@@ -991,7 +994,7 @@ OSStatus NVDecVT_Register(int rating)
         SuppFn supp = (SuppFn)dlsym(RTLD_DEFAULT, "VTRegisterSupplementalVideoDecoderIfAvailable");
         if (supp && !getenv("NVENCVT_NO_VP9SUPP")) { supp(CODEC_AV1); DLOG("opted in to AV1 decoding for this process"); }
     }
-    if (!av1Vp9Only && !getenv("NVENCVT_NO_MPEG2DEC")) {   // MPEG-1 / MPEG-2 and MPEG-4 Part 2 (M14): above Apple's software decoders
+    if (!av1Vp9Only && !blackwell && !getenv("NVENCVT_NO_MPEG2DEC")) {   // MPEG-1 / MPEG-2 and MPEG-4 Part 2 (M14): above Apple's software decoders
         const struct { FourCharCode c; const char *id, *name; } m[] = {
             { kCMVideoCodecType_MPEG2Video, DECODER_ID_MPEG2, "NVDEC - MPEG-2 - mickys/nvenc" },
             { kCMVideoCodecType_MPEG1Video, DECODER_ID_MPEG1, "NVDEC - MPEG-1 - mickys/nvenc" },

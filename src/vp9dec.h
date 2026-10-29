@@ -16,6 +16,7 @@ typedef struct {
     int bit_depth, bps;             // the session's bit depth; bytes per sample (1, or 2 for 10/12-bit)
     size_t pitch;                   // bytes
     RmMem setup, bs, probs, counts, seg[2], tiles, colmv[2], filter, intra, status, sem;
+    RmMem bw4dc;                    // Blackwell (NVDEC 0xcfb0): the buffer of method 0x4dc
     RmMem luma[VP9_SURFACES], chroma[VP9_SURFACES];
     unsigned w[VP9_SURFACES], h[VP9_SURFACES];  // the size each surface was decoded at
     bool busy[VP9_SURFACES];        // held by the caller until vp9dec_release
@@ -25,6 +26,7 @@ typedef struct {
     int last_w, last_h, last_show;  // the previous decoded frame (compute_image_size, 7.2.6)
     bool have_last;
     bool turing;                    // NVDEC 0xc4b0 (GTX 1650): no SET_INTRA_TOP_BUF_OFFSET
+    bool blackwell;                 // NVDEC 0xcfb0 (RTX 50): method 0x4dc, a word past Ada's struct, the 10-bit byte
     size_t flt_above, flt_bsd;      // offsets in the filter buffer
     NvU32 semval;
     bool verbose;

@@ -66,7 +66,7 @@ static FILE *gLogF;   // NVENCVT_LOG: stderr; flag file /tmp/nvencvt.log (apps s
 #define LOG(...) do { if (gLog) { FILE *lf_ = gLogF ? gLogF : stderr; fprintf(lf_, "nvencvt: " __VA_ARGS__); fputc('\n', lf_); fflush(lf_); } } while (0)
 
 enum { VT_MAX_B = 3 };
-enum { GPU_NONE = 0, GPU_ADA = 1, GPU_TU117 = 2, GPU_AMPERE = 3 };   // the GPUs the codecs register on
+enum { GPU_NONE = 0, GPU_ADA = 1, GPU_TU117 = 2, GPU_AMPERE = 3, GPU_BLACKWELL = 4 };   // the GPUs the codecs register on
 extern int gNvencvtGpu;                               // which of them (set by NVEncVT_Register)
 
 typedef struct {
@@ -943,8 +943,9 @@ static int pci_gpu_kind(void)
         if (ven) CFRelease(ven);
         if (dev) CFRelease(dev);
         if (v == 0x10de && found < 1) {
+            // GB20x (RTX 50) is NullMoth's device-id block 0x2b00-0x2fff; decoders only (NullMoth has encoders there)
             found = id >= 0x2600 && id <= 0x28ff ? GPU_ADA : id >= 0x1f80 && id <= 0x1fff ? GPU_TU117
-                  : id >= 0x2200 && id <= 0x25ff ? GPU_AMPERE : GPU_NONE;
+                  : id >= 0x2200 && id <= 0x25ff ? GPU_AMPERE : id >= 0x2b00 && id <= 0x2fff ? GPU_BLACKWELL : GPU_NONE;
             if (found > 0) card_name_from(d);
         }
         IOObjectRelease(d);
@@ -1041,10 +1042,14 @@ static void rename_encoders(const char *const ids[], const char *const names[], 
 // registers the H.264 (avc1) and HEVC (hvc1) encoders; returns the H.264 registration's status
 __attribute__((visibility("default"))) OSStatus NVEncVT_Register(int rating)
 {
+    // once per process, as the library may be both NullMoth's decoder library (see init) and the NVMTL_NVENCVT one
+    static int done; static OSStatus first;
+    if (done++) return first;
+    first = kVTCouldNotFindVideoEncoderErr;
     int gpu = getenv("NVENCVT_ANY_GPU") ? GPU_ADA : pci_gpu_kind();
     if (gpu < 0) gpu = gpu_nvenc_kind();   // no PCI match (unusual): ask RM for the class list
     if (gpu <= 0) {
-        LOG("GPU is neither Ada, TU117 nor GA10x (NVENC class c9b7 / b4b7 / c7b7): not registering");
+        LOG("GPU is neither Ada, TU117, GA10x nor GB20x (NVENC class c9b7 / b4b7 / c7b7, PCI 2b00-2fff): not registering");
         return kVTCouldNotFindVideoEncoderErr;
     }
     gNvencvtGpu = gpu;
@@ -1079,8 +1084,9 @@ __attribute__((visibility("default"))) OSStatus NVEncVT_Register(int rating)
     // GA10x (RTX 30): the NVENC there is not Ada's, and our encoder setups are written for NVENC 8.2 (Ada) and 6.6
     // (TU117). Registering them anyway would make VideoToolbox pick an encoder that cannot start (NullMoth's own
     // encoders stay for these cards), so only the decoders register on GA10x. NVENCVT_AMPERE_ENC=1 tries them anyway.
-    const bool encoders = gpu != GPU_AMPERE || getenv("NVENCVT_AMPERE_ENC");
-    if (!encoders) LOG("GA10x (RTX 30): the decoders only (NVENCVT_AMPERE_ENC=1 registers the encoders too)");
+    const bool encoders = gpu != GPU_BLACKWELL && (gpu != GPU_AMPERE || getenv("NVENCVT_AMPERE_ENC"));
+    if (gpu == GPU_AMPERE && !encoders) LOG("GA10x (RTX 30): the decoders only (NVENCVT_AMPERE_ENC=1 registers the encoders too)");
+    if (gpu == GPU_BLACKWELL) LOG("GB20x (RTX 50): the H.264 and HEVC decoders only; NullMoth's encoders stay");
     OSStatus st = encoders ? register_one(kCMVideoCodecType_H264, CFSTR(ENCODER_ID), na, rating) : kVTCouldNotFindVideoEncoderErr;
     OSStatus sh = !encoders || getenv("NVENCVT_NO_HEVC") ? kVTCouldNotFindVideoEncoderErr
                 : register_one(kCMVideoCodecType_HEVC, CFSTR(ENCODER_ID_HEVC), nh, rating);
@@ -1096,7 +1102,21 @@ __attribute__((visibility("default"))) OSStatus NVEncVT_Register(int rating)
     rename_encoders(ids, names, codecs, nreg);
     extern OSStatus NVDecVT_Register(int rating);   // vt/nvencvt_dec.c: the H.264 decoder (NVDEC), same rating
     NVDecVT_Register(rating);
-    return st;
+    return first = st;
+}
+
+// installed in the plugin bundle in place of NullMoth's own decoder libraries (libnvdec_h264.dylib,
+// libnvdec_hevc.dylib), this library answers for them. NullMoth's plugin opens those in every process that gets a Metal device
+// on the card and, for Apple's sandboxed apps (QuickTime, Photos, Quick Look), in VTDecoderXPCService, and registers their
+// factories under its own IDs: these are ours. Opened that way, init below also registers our IDs, VP9 and AV1 included.
+extern OSStatus NVDecVT_CreateInstance(FourCharCode codec, CFAllocatorRef al, void **out);   // vt/nvencvt_dec.c (VTVideoDecoderRef *)
+__attribute__((visibility("default"))) OSStatus NVDecH264_CreateInstance(FourCharCode codec, CFAllocatorRef al, void **out)
+{
+    return NVDecVT_CreateInstance(codec, al, out);
+}
+__attribute__((visibility("default"))) OSStatus NVDecHEVC_CreateInstance(FourCharCode codec, CFAllocatorRef al, void **out)
+{
+    return NVDecVT_CreateInstance(codec, al, out);
 }
 
 // System-wide settings for apps that do not get our environment variables (started from the Dock / Finder):
@@ -1132,6 +1152,8 @@ __attribute__((constructor)) static void init(void)
         if ((gLogF = fopen(p, "a"))) gLog = true;
     }
     const char *ins = getenv("DYLD_INSERT_LIBRARIES");
-    if (ins && strstr(ins, "nvencvt") && !getenv("NVENCVT_NO_REGISTER"))
+    Dl_info me;   // opened by NullMoth's plugin as its decoder library (see NVDecH264_CreateInstance)
+    const bool asNullMoth = dladdr((const void *)init, &me) && me.dli_fname && strstr(me.dli_fname, "/libnvdec_");
+    if (((ins && strstr(ins, "nvencvt")) || asNullMoth) && !getenv("NVENCVT_NO_REGISTER"))
         NVEncVT_Register(getenv("NVENCVT_RATING") ? atoi(getenv("NVENCVT_RATING")) : 1100);
 }

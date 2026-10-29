@@ -29,6 +29,7 @@ int hevcdec_open(HevcDec *d, Rm *rm, unsigned maxW, unsigned maxH, int bit_depth
     d->first_pic = true; d->after_eos = true;
     NV_NVDEC_ALLOCATION_PARAMETERS dp = { .size = sizeof dp, .prohibitMultipleInstances = 0, .engineInstance = 0 };
     d->turing = rm_class(rm, RM_CLS_NVDEC) == 0xc4b0;
+    d->blackwell = rm_class(rm, RM_CLS_NVDEC) == 0xcfb0;
     if (chan_create(rm, &d->chan, NV2080_ENGINE_TYPE_NVDEC0, rm_class(rm, RM_CLS_NVDEC), &dp)) { fprintf(stderr, "hevcdec: channel failed\n"); return -1; }
     const size_t b16 = (size_t)(d->maxW / 16) * (d->maxH / 16);
     // co-located MVs: 128 bytes per 16x16 block per picture (generous; the headers give no size)
@@ -58,8 +59,12 @@ int hevcdec_open(HevcDec *d, Rm *rm, unsigned maxW, unsigned maxH, int bit_depth
     struct { RmMem *m; size_t size; } b[] = {
         { &d->setup, 0x2000 }, { &d->bs, d->auCap + 0x1000 }, { &d->scaling, 0x1000 }, { &d->tiles, 0x1000 },
         { &d->filter, flt }, { &d->coloc, d->colmv_size * HEVC_SURFACES }, { &d->intra, (size_t)d->maxW * 8 * (size_t)d->bps },
-        { &d->slinfo, 0x10000 }, { &d->status, 0x1000 }, { &d->sem, 0x1000 } };
+        { &d->slinfo, 0x10000 }, { &d->status, 0x1000 }, { &d->sem, 0x1000 },
+        // Blackwell's engine does not complete a picture until method 0x4dc (not in clc9b0.h; NullMoth's decoder sets it
+        // on the RTX 5050) points at a buffer. At 1920x1088 8-bit it wrote 11.5 KB of it; give it 1 MB plus 256 bytes per column
+        { &d->bw4dc, d->blackwell ? ((size_t)1 << 20) + (size_t)d->maxW * 256 * (size_t)d->bps * (chroma_format == 3 ? 2 : 1) : 0 } };
     for (size_t i = 0; i < sizeof b / sizeof b[0]; i++) {
+        if (!b[i].size) continue;
         if (rm_mem_alloc(rm, b[i].m, (b[i].size + 0xfff) & ~(size_t)0xfff, 0x1000, true, true, true)) { fprintf(stderr, "hevcdec: alloc failed\n"); return -1; }
         memset(b[i].m->cpu, 0, b[i].m->size);
     }
@@ -75,7 +80,7 @@ int hevcdec_open(HevcDec *d, Rm *rm, unsigned maxW, unsigned maxH, int bit_depth
 void hevcdec_close(HevcDec *d)
 {
     chan_destroy(&d->chan);
-    RmMem *m[] = { &d->setup, &d->bs, &d->scaling, &d->tiles, &d->filter, &d->coloc, &d->intra, &d->slinfo, &d->status, &d->sem };
+    RmMem *m[] = { &d->setup, &d->bs, &d->scaling, &d->tiles, &d->filter, &d->coloc, &d->intra, &d->slinfo, &d->status, &d->sem, &d->bw4dc };
     for (size_t i = 0; i < sizeof m / sizeof m[0]; i++) rm_mem_free(d->rm, m[i]);
     for (int i = 0; i < HEVC_SURFACES; i++) { rm_mem_free(d->rm, &d->luma[i]); rm_mem_free(d->rm, &d->chroma[i]); }
     free(d->au); d->au = NULL;
@@ -322,6 +327,12 @@ static int decode_pending(HevcDec *d)
     for (int i = 0; i < 6; i++) { x->cb_qp_adjustment[i] = (char)pps->cb_qp_offset_list[i]; x->cr_qp_adjustment[i] = (char)pps->cr_qp_offset_list[i]; }
     x->HevcFltAboveOffset = (unsigned)(d->flt_above >> 8); x->HevcSaoAboveOffset = (unsigned)(d->flt_sao_above >> 8);
     ps->v3.HevcSliceEdgeOffset = (unsigned)(d->flt_edge >> 8);
+    // past Ada's struct (276 bytes), the word at 0x11c is 0x10 in every picture NullMoth's decoder sends on the RTX 5050;
+    // without it IDR pictures decode and every P / B picture is answered with status 0x5 within 0.1 ms. Meaning unknown
+    if (d->blackwell) ((NvU32 *)ps)[0x11c / 4] = 0x10;
+    // and reserved7 is 3 in every picture of a 10-bit stream (0 at 8-bit); without it 10-bit P / B pictures decode with no error
+    // but wrong. One bit per plane deeper than 8 is a guess that fits both: 12-bit and unequal depths were not observed
+    if (d->blackwell) ps->reserved7 = (unsigned short)((sps->bit_depth_luma > 8 ? 1 : 0) | (sps->bit_depth_chroma > 8 ? 2 : 0));
     // tile sizes in CTBs, per tile in raster order: width, height (2 bytes each, GIP_ASIC_TILE_SIZE)
     int cols[21], rows[23]; hevc_tiles(sps, pps, cols, rows);
     uint16_t *ts = d->tiles.cpu; memset(ts, 0, GIP_ASIC_TILE_SIZE);
@@ -342,6 +353,7 @@ static int decode_pending(HevcDec *d)
     // not on Turing (0xc4b0): its class has no such method and NVIDIA's driver sends none there (VP9: given one, that engine
     // misused the buffer; docs/traces/vp9dec-gtx1650-linux); HEVC never touched it on Turing anyway
     if (!d->turing) chan_mthd(c, 0, NVC9B0_SET_INTRA_TOP_BUF_OFFSET, 1, hi(d->intra.gpu));
+    if (d->blackwell) chan_mthd(c, 0, 0x4dc, 1, hi(d->bw4dc.gpu));   // see hevcdec_open
     chan_mthd(c, 0, NVC9B0_HEVC_SET_SCALING_LIST_OFFSET, 1, hi(d->scaling.gpu));
     chan_mthd(c, 0, NVC9B0_HEVC_SET_TILE_SIZES_OFFSET, 1, hi(d->tiles.gpu));
     chan_mthd(c, 0, NVC9B0_HEVC_SET_FILTER_BUFFER_OFFSET, 1, hi(d->filter.gpu));

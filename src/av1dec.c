@@ -25,9 +25,15 @@ int av1dec_open(Av1Dec *d, Rm *rm, unsigned maxW, unsigned maxH, int bit_depth)
 {
     memset(d, 0, sizeof *d);
     d->rm = rm; d->maxW = (maxW + 127) & ~127u; d->maxH = (maxH + 127) & ~127u;
-    // AV1 decoding came with Ampere's NVDEC (GA10x 0xc7b0, Ada 0xc9b0); Turing (0xc4b0) and GA100 (0xc6b0) have none
+    // AV1 decoding came with Ampere's NVDEC (GA10x 0xc7b0, Ada 0xc9b0, Blackwell GB20x 0xcfb0); Turing (0xc4b0) and GA100
+    // (0xc6b0) have none
     const NvU32 cls = rm_class(rm, RM_CLS_NVDEC);
-    if (cls != 0xc7b0 && cls != 0xc9b0) { fprintf(stderr, "av1dec: this GPU's NVDEC (class 0x%x) has no AV1\n", cls); return -1; }
+    if (cls != 0xc7b0 && cls != 0xc9b0 && cls != 0xcfb0) { fprintf(stderr, "av1dec: this GPU's NVDEC (class 0x%x) has no AV1\n", cls); return -1; }
+    d->blackwell = cls == 0xcfb0;
+    // on the RTX 5050 10-bit key frames decode bit-exact and every inter frame comes out wrong, with no error. HEVC
+    // and VP9 needed a 3 in a reserved field for 10-bit there; no single field of the AV1 setup (nor its extension, the
+    // reference entries, strides or further methods) did it, so 10-bit AV1 is refused rather than shown wrong
+    if (d->blackwell && bit_depth > 8) { fprintf(stderr, "av1dec: 10-bit AV1 is not supported on Blackwell yet\n"); return -1; }
     d->bit_depth = bit_depth; d->bps = bit_depth > 8 ? 2 : 1;
     d->pitch = (size_t)d->maxW * (size_t)d->bps;
     for (int i = 0; i < 8; i++) d->ref[i] = -1;
@@ -50,8 +56,10 @@ int av1dec_open(Av1Dec *d, Rm *rm, unsigned maxW, unsigned maxH, int bit_depth)
         { &d->setup, 0x2000 }, { &d->bs, bsCap }, { &d->cdf_def, d->cdf_size + 4096 }, { &d->cdf_out, d->cdf_size + 4096 },
         { &d->tileinfo, AV1_TILEINFO_BUF_SIZE }, { &d->tilestream, AV1_TILESTREAMINFO_BUF_SIZE }, { &d->filter, flt },
         { &d->intra, AV1_INTRA_TOP_BUF_SIZE * (size_t)d->bps }, { &d->gm, AV1_GLOBAL_MOTION_BUF_SIZE }, { &d->fg, AV1_FGS_BUF_SIZE },
-        { &d->status, 0x1000 }, { &d->sem, 0x1000 } };
-    for (size_t i = 0; i < sizeof b / sizeof b[0]; i++) if (alloc(rm, b[i].m, b[i].size)) { fprintf(stderr, "av1dec: alloc failed\n"); return -1; }
+        { &d->status, 0x1000 }, { &d->sem, 0x1000 },
+        // as for HEVC and VP9, Blackwell's engine needs method 0x4dc to point at a buffer
+        { &d->bw4dc, d->blackwell ? ((size_t)1 << 20) + W * 256 * (size_t)d->bps : 0 } };
+    for (size_t i = 0; i < sizeof b / sizeof b[0]; i++) if (b[i].size && alloc(rm, b[i].m, b[i].size)) { fprintf(stderr, "av1dec: alloc failed\n"); return -1; }
     for (int i = 0; i < 8; i++) if (alloc(rm, &d->cdf[i], d->cdf_size + 4096)) return -1;
     if (alloc(rm, &d->zseg, AV1_SEGMENT_ID_BUF_SIZE(W, H))) return -1;
     const size_t luma = nvenc_in_plane_size(d->pitch, d->maxH) + 65536, chroma = nvenc_in_plane_size(d->pitch, d->maxH / 2) + 65536;
@@ -67,7 +75,7 @@ int av1dec_open(Av1Dec *d, Rm *rm, unsigned maxW, unsigned maxH, int bit_depth)
 void av1dec_close(Av1Dec *d)
 {
     chan_destroy(&d->chan);
-    RmMem *m[] = { &d->setup, &d->bs, &d->cdf_def, &d->cdf_out, &d->tileinfo, &d->tilestream, &d->filter, &d->intra, &d->gm, &d->fg, &d->status, &d->sem };
+    RmMem *m[] = { &d->setup, &d->bs, &d->cdf_def, &d->cdf_out, &d->tileinfo, &d->tilestream, &d->filter, &d->intra, &d->gm, &d->fg, &d->status, &d->sem, &d->bw4dc };
     for (size_t i = 0; i < sizeof m / sizeof m[0]; i++) rm_mem_free(d->rm, m[i]);
     for (int i = 0; i < 8; i++) rm_mem_free(d->rm, &d->cdf[i]);
     rm_mem_free(d->rm, &d->zseg);
@@ -539,6 +547,10 @@ static int decode_frame(Av1Dec *d)
         chan_mthd(c, 0, NVC9B0_SET_DISPLAY_BUF_CHROMA_OFFSET, 1, hi(d->chroma[disp].gpu));
     }
     #undef BUF
+    if (d->blackwell) {   // method 0x4dc, and the word 0x10 just past Ada's struct + 8, as for HEVC and VP9
+        chan_mthd(c, 0, 0x4dc, 1, hi(d->bw4dc.gpu));
+        ((NvU32 *)d->setup.cpu)[(sizeof(nvdec_av1_pic_s) + 8) / 4] = 0x10;
+    }
     chan_mthd(c, 0, NVC9B0_EXECUTE, 1, 0u);
     const NvU32 val = ++d->semval; volatile NvU32 *sv = d->sem.cpu;
     chan_mthd(c, 0, NVC9B0_SEMAPHORE_A, 3, (NvU32)(d->sem.gpu >> 32), (NvU32)d->sem.gpu, val);

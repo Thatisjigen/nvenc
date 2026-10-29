@@ -39,6 +39,69 @@ size_t nvenc_in_offset(size_t x, size_t y, size_t pitch)
 
 size_t nvenc_in_plane_size(size_t pitch, size_t rows) { return pitch * ((rows + 15) / 16) * 16; }
 
+// ---- NVDEC output on Blackwell ----
+// Mesa src/nouveau/nil/copy.rs (main f01e9b07), offsets inside a 64 x 8 GOB: Blackwell2D1BPP = 8-byte lines, 8 rows of an
+// 8-byte column after each other, columns left to right; Blackwell2D2BPP = Turing's 16 x 4 runs with rows 4-7 before the
+// second 16-byte column. Blocks of two GOBs (16 rows) and 1 KB tiles as before.
+int nvdec_gob_blackwell;
+static inline size_t nvdec_gob(size_t x, size_t y, unsigned bpp)
+{
+    if (nvdec_gob_blackwell && bpp == 1) return (x % 8) + (y % 8) * 8 + ((x / 8) % 8) * 64;
+    if (nvdec_gob_blackwell && bpp == 2) return (x % 16) + (y % 4) * 16 + ((y / 4) % 2) * 64 + ((x / 16) % 2) * 128 + ((x / 32) % 2) * 256;
+    return (x % 16) + (y % 4) * 16 + ((x / 16) % 2) * 64 + ((y / 4) % 2) * 128 + ((x / 32) % 2) * 256;
+}
+size_t nvdec_offset(size_t x, size_t y, size_t pitch, unsigned bpp)
+{
+    return (y / 16) * pitch * 16 + (x / 64) * 1024 + ((y / 8) % 2) * 512 + nvdec_gob(x, y, bpp);
+}
+static void nvdec_untile_band_slow(uint8_t *dst, size_t dst_stride, const uint8_t *src, size_t x0, size_t width, size_t y0, size_t y1, size_t pitch, unsigned bpp)
+{
+    const size_t run = bpp == 1 ? 8 : 16;
+    for (size_t y = y0; y < y1; y++)
+        for (size_t x = x0; x < width; x += run) {
+            const size_t n = width - x < run ? width - x : run;   // a run is contiguous in both GOBs
+            memcpy(dst + y * dst_stride + x, src + nvdec_offset(x, y, pitch, bpp), n);
+        }
+}
+// one band of 16 rows, whole 1 KB tiles read in order with SSE (4K H.264: 6.2 ms per picture with memcpy per run)
+static void nvdec_untile_band(uint8_t *dst, size_t dst_stride, const uint8_t *src, size_t width, size_t band, size_t rows, size_t pitch, unsigned bpp)
+{
+    const size_t y0 = band * 16, y1 = y0 + 16 < rows ? y0 + 16 : rows;
+    if (y1 - y0 < 16 || ((uintptr_t)src & 15)) { nvdec_untile_band_slow(dst, dst_stride, src, 0, width, y0, y1, pitch, bpp); return; }
+    const size_t full = width / 64;
+    for (size_t t = 0; t < full; t++) {
+        const __m128i *s = (const __m128i *)(src + band * pitch * 16 + t * 1024);
+        uint8_t *d0 = dst + y0 * dst_stride + t * 64;
+        for (int g = 0; g < 2; g++) {   // the two GOBs of the block, rows 0-7 and 8-15
+            uint8_t *d = d0 + (size_t)g * 8 * dst_stride;
+            if (bpp == 1)   // Blackwell8Bit: eight 8-byte columns of 8 rows, each 64 contiguous bytes
+                for (int c = 0; c < 8; c++)
+                    for (int r = 0; r < 8; r += 2) {
+                        const __m128i v = _mm_load_si128(s++);
+                        _mm_storel_epi64((__m128i *)(d + (size_t)r * dst_stride + c * 8), v);
+                        _mm_storel_epi64((__m128i *)(d + (size_t)(r + 1) * dst_stride + c * 8), _mm_unpackhi_epi64(v, v));
+                    }
+            else            // Blackwell16Bit: 32-byte halves, 16-byte columns, rows 0-3 then 4-7
+                for (int x32 = 0; x32 < 2; x32++)
+                    for (int x16 = 0; x16 < 2; x16++)
+                        for (int r = 0; r < 8; r++)
+                            _mm_storeu_si128((__m128i *)(d + (size_t)r * dst_stride + x32 * 32 + x16 * 16), _mm_load_si128(s++));
+        }
+    }
+    if (full * 64 < width) nvdec_untile_band_slow(dst, dst_stride, src, full * 64, width, y0, y1, pitch, bpp);
+}
+void nvdec_untile_plane(uint8_t *dst, size_t dst_stride, const uint8_t *src, size_t width, size_t rows, size_t pitch, unsigned bpp)
+{
+    if (!nvdec_gob_blackwell || bpp > 2) { nvenc_in_untile_plane(dst, dst_stride, src, width, rows, pitch); return; }
+    const size_t bands = (rows + 15) / 16;
+    if (bands >= 32) {   // as nvenc_in_untile_plane: memory-bound, four threads
+        const size_t chunks = 4, per = (bands + chunks - 1) / chunks;
+        dispatch_apply(chunks, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^(size_t k) {
+            for (size_t b = k * per; b < (k + 1) * per && b < bands; b++) nvdec_untile_band(dst, dst_stride, src, width, b, rows, pitch, bpp); });
+    } else
+        for (size_t b = 0; b < bands; b++) nvdec_untile_band(dst, dst_stride, src, width, b, rows, pitch, bpp);
+}
+
 // ---- the other way: NVENC's input layout (also what NVDEC writes, tileFormat 1 / gob_height 0) to pitch-linear ----
 static void untile_band_slow(uint8_t *dst, size_t dst_stride, const uint8_t *src, size_t x0, size_t width, size_t y0, size_t y1, size_t pitch)
 {

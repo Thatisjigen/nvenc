@@ -16,6 +16,7 @@ typedef struct {
     int bit_depth, bps;
     size_t pitch;                   // bytes
     RmMem setup, bs, cdf_def, cdf_out, tileinfo, tilestream, filter, intra, gm, fg, status, sem;
+    RmMem bw4dc; bool blackwell;   // Blackwell (NVDEC 0xcfb0): the buffer of method 0x4dc
     RmMem cdf[8];                   // the CDF tables saved with each reference slot (what the engine wrote)
     RmMem tmv[AV1_SURFACES], seg[AV1_SURFACES];   // per surface: temporal MVs and segment IDs it wrote
     RmMem luma[AV1_SURFACES], chroma[AV1_SURFACES];
