@@ -95,6 +95,7 @@ NV_STATUS chan_submit(Chan *c)
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
     ((volatile AmpereAControlGPFifo *)c->userd.cpu)->GPPut = c->gpPut;
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    (void)((volatile AmpereAControlGPFifo *)c->userd.cpu)->GPPut;   // USERD is in VRAM: the read flushes the write through BAR1
     *c->doorbell = c->token;
     return NV_OK;
 }
