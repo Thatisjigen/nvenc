@@ -315,7 +315,7 @@ int vp9dec_frame(Vp9Dec *d, const uint8_t *buf, size_t n)
               DRF_DEF(C9B0, _SEMAPHORE_D, _OPERATION, _RELEASE) | DRF_DEF(C9B0, _SEMAPHORE_D, _PAYLOAD_SIZE, _32BIT));
     const double t0 = now_ms();
     chan_submit(c);
-    while (sv[0] != val && now_ms() - t0 < 1000) { }
+    while (sv[0] != val && now_ms() - t0 < 3000) { }
     d->engine_ms = now_ms() - t0;
     if (sv[0] != val) { fprintf(stderr, "vp9dec: no completion (error notifier 0x%x)\n", chan_error(c)); return -1; }
     chan_settled(c);

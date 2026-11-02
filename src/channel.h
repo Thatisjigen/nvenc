@@ -14,6 +14,7 @@ typedef struct {
     NvU32 *segStart;                   // start of the not yet submitted commands
     bool settled;                      // the caller saw everything submitted so far complete (chan_settled)
     bool overrun;                      // commands dropped because the push buffer was full: the next chan_submit fails
+    bool holdClocks; long heldUntil;   // RTX 50 decoders: GPU clocks held while frames come (hold_clocks)
 } Chan;
 
 // engineType: NV2080_ENGINE_TYPE_*; objClass/objParams: the engine object (e.g. 0xc9b7 + NV_NVENC_ALLOCATION_PARAMETERS)

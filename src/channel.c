@@ -2,7 +2,10 @@
 #include "channel.h"
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#include "ctrl/ctrl2080/ctrl2080perf.h"
 #include "class/cl0002.h"
 #include "class/clc56f.h"
 #include "class/clc361.h"
@@ -13,6 +16,21 @@
 #include "ctrl/ctrlc36f.h"
 
 #define CHK(x) do { NV_STATUS s_ = (x); if (s_) { fprintf(stderr, "chan: %s -> 0x%x\n", #x, s_); return s_; } } while (0)
+
+// RTX 5050 with the clocks left to the driver (BOOST=0 in nvrm610.conf): when they change under load the channel stops for over
+// a second, now and then for good, with no error notifier and no MMU fault, and neither a doorbell nor a new submit wakes it (H.264
+// in Chromium: a stop within 100 to 5000 frames; with the clocks held, none in 54 000). Held only while frames come: renewed for
+// 15 s at a time, so the clocks are free again 15 s after the last frame. NVDEC_NOBOOST=1 leaves it out.
+static void hold_clocks(Chan *c)
+{
+    if (!c->holdClocks) return;
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    if (t.tv_sec + 10 < c->heldUntil) return;
+    c->heldUntil = t.tv_sec + 15;
+    NV2080_CTRL_PERF_BOOST_PARAMS p = { .flags = NV2080_CTRL_PERF_BOOST_FLAGS_CMD_BOOST_TO_MAX, .duration = 15 };
+    NV_STATUS st = rm_ctrl(c->rm, c->rm->subdevice, NV2080_CTRL_CMD_PERF_BOOST, &p, sizeof p);
+    if (st) fprintf(stderr, "chan: holding the clocks -> 0x%x\n", st);
+}
 
 NV_STATUS chan_create(Rm *rm, Chan *c, NvU32 engineType, NvU32 objClass, void *objParams)
 {
@@ -29,6 +47,7 @@ NV_STATUS chan_create(Rm *rm, Chan *c, NvU32 engineType, NvU32 objClass, void *o
     CHK(rm_mem_alloc(rm, &c->gpfifo, c->entries * 8, 0x1000, true, true, true));
     CHK(rm_mem_alloc(rm, &c->push, 0x10000, 0x1000, true, true, true));
     c->cur = c->segStart = c->push.cpu;
+    c->holdClocks = objClass == 0xcfb0 && !getenv("NVDEC_NOBOOST");   // GB20x's NVDEC
 
     NV_CONTEXT_DMA_ALLOCATION_PARAMS cd = { .flags = DRF_DEF(OS03, _FLAGS, _MAPPING, _KERNEL) | DRF_DEF(OS03, _FLAGS, _HASH_TABLE, _DISABLE),
                                            .hMemory = c->notifier.hPhys, .offset = 0, .limit = c->notifier.size - 1 };
@@ -84,6 +103,7 @@ NV_STATUS chan_submit(Chan *c)
         c->overrun = false; c->cur = c->segStart;
         return NV_ERR_INSUFFICIENT_RESOURCES;
     }
+    hold_clocks(c);
     NvU64 va = c->push.gpu + (NvU64)((NvU8 *)c->segStart - (NvU8 *)c->push.cpu);
     NvU32 dwords = (NvU32)(c->cur - c->segStart);
     if (!dwords) return NV_OK;
