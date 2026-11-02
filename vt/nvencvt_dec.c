@@ -469,8 +469,8 @@ static OSStatus set_output(DState *s, VTVideoDecoderSession session, CMVideoForm
         CFRelease(attrs); attrs = m;
     }
     st = VTDecoderSessionSetPixelBufferAttributes(session, attrs);
-    CFRelease(attrs); CFRelease(ios); CFRelease(npf); CFRelease(nw); CFRelease(nh);
-    // Our own pool, made with the client's destination attributes verbatim (PR #1). A client that asks for an
+    CFRelease(ios); CFRelease(npf); CFRelease(nw); CFRelease(nh);   // attrs: our own pool below is made from it
+    // Our own pool, made with the client's destination attributes and the backing negotiated above (PR #1). A client that asks for an
     // OpenGL-compatible buffer (ffmpeg, mpv: kCVPixelBufferIOSurfaceOpenGLTextureCompatibilityKey) cannot have one on
     // this system: CVPixelBufferIsCompatibleWithAttributes answers 0 for every buffer, even one made with those very
     // attributes. VideoToolbox then transfers every decoded picture into a buffer of its own (14-32 ms per 4K frame
@@ -486,7 +486,11 @@ static OSStatus set_output(DState *s, VTVideoDecoderSession session, CMVideoForm
         if ((x = CFDictionaryGetValue(dst, kCVPixelBufferHeightKey)) && CFGetTypeID(x) == CFNumberGetTypeID()) CFNumberGetValue(x, kCFNumberIntType, &dh);
         const bool fits = want == pf && dw == s->w && dh == s->h;
         if (fits) {
-            CFMutableDictionaryRef m = CFDictionaryCreateMutableCopy(NULL, 0, dst);   // the size made explicit (a pool needs one)
+            // From attrs, not from dst alone: attrs carries the client's keys (its format is ours, so they were copied above)
+            // plus the IOSurface properties and Metal compatibility. Chromium asks for PixelFormatType only; a pool made from
+            // that dictionary hands out heap-backed buffers, which its GPU frame converter cannot import (its GPU process then
+            // crashes during VP9 playback). Adapted from HighDelay's Turing fix (nvidia-macos-driver-nvk dc0f00d).
+            CFMutableDictionaryRef m = CFDictionaryCreateMutableCopy(NULL, 0, attrs);   // the size made explicit (a pool needs one)
             CFNumberRef w2 = CFNumberCreate(NULL, kCFNumberIntType, &s->w), h2 = CFNumberCreate(NULL, kCFNumberIntType, &s->h);
             CFDictionarySetValue(m, kCVPixelBufferWidthKey, w2); CFDictionarySetValue(m, kCVPixelBufferHeightKey, h2);
             CFRelease(w2); CFRelease(h2);
@@ -495,9 +499,10 @@ static OSStatus set_output(DState *s, VTVideoDecoderSession session, CMVideoForm
             else if (pool) CVPixelBufferPoolRelease(pool);
             CFRelease(m);
         }
-        DLOG("  our own pool: %s", s->ownPool ? "yes (the client's destination attributes)" : fits ? "no (CVPixelBufferPoolCreate failed)"
+        DLOG("  our own pool: %s", s->ownPool ? "yes (the client's destination attributes and the negotiated backing)" : fits ? "no (CVPixelBufferPoolCreate failed)"
                                     : "no (the client's format or size is not the picture's: the session's pool, VideoToolbox converts)");
     }
+    CFRelease(attrs);
     if (dst) CFRelease(dst);
     CFMutableDictionaryRef col = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
     // colour description and HDR metadata from the format description (the extension keys are the attachment keys), as
