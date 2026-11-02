@@ -101,10 +101,13 @@ NV_STATUS chan_submit(Chan *c)
 
 bool chan_rewind(Chan *c)
 {
-    // the push buffer is linear: start over once the channel has fetched everything: GPGet == GPPut, or the caller saw its
-    // last submit complete. GPGet alone is not enough: on the RTX 5050 it still reads 0 three seconds after the work completed,
-    // and the buffer filled up after 64 KiB of commands (170 H.264, 199 AV1 or 292 VP9 frames, then writes past its end)
-    if (c->cur != c->segStart || (!c->settled && chan_gpget(c) != c->gpPut)) return false;
+    // the push buffer is linear: start over once the channel has fetched everything, GPGet == GPPut. GPGet alone is not enough:
+    // on the RTX 5050 it still reads 0 three seconds after the work completed, and the buffer filled up after 64 KiB of commands
+    // (170 H.264, 199 AV1 or 292 VP9 frames, then writes past its end). There the caller's word that its last submit completed
+    // stands in for it, but only once the buffer is well used: starting over after every frame, the same address again and again,
+    // left about one frame in a hundred without completion (no error notifier; the next one went through)
+    if (c->cur != c->segStart) return false;
+    if (chan_gpget(c) != c->gpPut && !(c->settled && chan_push_used(c) > c->push.size * 3 / 4)) return false;
     c->cur = c->segStart = c->push.cpu;
     return true;
 }
