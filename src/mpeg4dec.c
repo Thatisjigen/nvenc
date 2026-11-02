@@ -252,6 +252,7 @@ static int decode_vop(Mpeg4Dec *d, const uint8_t *vop, size_t len, const VopInfo
             (unsigned long long)fa, ft, fs, (unsigned long long)d->bs.gpu, (unsigned long long)d->setup.gpu, (unsigned long long)d->hist.gpu, (unsigned long long)d->scratch.gpu);
         return -1;
     }
+    chan_settled(c);
     const nvdec_status_s *st = d->status.cpu;
     d->mbs_ok = st->mbs_correctly_decoded; d->mbs_err = st->mbs_in_error; d->err_status = st->error_status;
     if (d->verbose)

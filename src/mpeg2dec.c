@@ -181,6 +181,7 @@ static int decode_pending(Mpeg2Dec *d)
     while (sv[0] != val && now_ms() - t0 < 1000) { }
     d->engine_ms = now_ms() - t0;
     if (sv[0] != val) { fprintf(stderr, "mpeg2dec: no completion (error notifier 0x%x)\n", chan_error(c)); return -1; }
+    chan_settled(c);
     const nvdec_status_s *st = d->status.cpu;
     d->mbs_ok = st->mbs_correctly_decoded; d->mbs_err = st->mbs_in_error; d->err_status = st->error_status;
     if (d->verbose)

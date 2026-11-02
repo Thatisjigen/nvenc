@@ -194,6 +194,7 @@ int vp8dec_frame(Vp8Dec *d, const uint8_t *buf, size_t len)
         if (chan_error(c) && !chan_fault(c, &fa, &ft, fs)) fprintf(stderr, "vp8dec: MMU fault at 0x%llx type %u %s\n", (unsigned long long)fa, ft, fs);
         return -1;
     }
+    chan_settled(c);
     const nvdec_status_s *st = d->status.cpu;
     d->mbs_ok = st->mbs_correctly_decoded; d->mbs_err = st->mbs_in_error; d->err_status = st->error_status; d->result = ps->resultValue;
     if (d->verbose > 1) {   // what did the engine write into the probability buffer?

@@ -67,6 +67,9 @@ void chan_destroy(Chan *c)
 
 void chan_mthd(Chan *c, int subch, NvU32 mthd, int count, ...)
 {
+    // the push buffer is linear and what follows it is not ours: drop the commands, chan_submit then fails and the caller
+    // reports no completion, instead of the process writing over whatever is mapped next
+    if ((NvU8 *)(c->cur + 1 + count) > (NvU8 *)c->push.cpu + c->push.size) { c->overrun = true; return; }
     *c->cur++ = DRF_NUM(C56F, _DMA, _SEC_OP, NVC56F_DMA_SEC_OP_INC_METHOD) | DRF_NUM(C56F, _DMA, _METHOD_COUNT, count) |
                 DRF_NUM(C56F, _DMA, _METHOD_SUBCHANNEL, subch) | DRF_NUM(C56F, _DMA, _METHOD_ADDRESS, mthd >> 2);
     va_list ap; va_start(ap, count);
@@ -76,6 +79,11 @@ void chan_mthd(Chan *c, int subch, NvU32 mthd, int count, ...)
 
 NV_STATUS chan_submit(Chan *c)
 {
+    if (c->overrun) {
+        fprintf(stderr, "chan: push buffer full, nothing submitted\n");
+        c->overrun = false; c->cur = c->segStart;
+        return NV_ERR_INSUFFICIENT_RESOURCES;
+    }
     NvU64 va = c->push.gpu + (NvU64)((NvU8 *)c->segStart - (NvU8 *)c->push.cpu);
     NvU32 dwords = (NvU32)(c->cur - c->segStart);
     if (!dwords) return NV_OK;
@@ -83,7 +91,7 @@ NV_STATUS chan_submit(Chan *c)
     e[0] = DRF_NUM(C56F, _GP_ENTRY0, _GET, (NvU32)va >> 2);
     e[1] = DRF_NUM(C56F, _GP_ENTRY1, _GET_HI, (NvU32)(va >> 32)) | DRF_NUM(C56F, _GP_ENTRY1, _LENGTH, dwords);
     c->gpPut = (c->gpPut + 1) % c->entries;
-    c->segStart = c->cur;
+    c->segStart = c->cur; c->settled = false;
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
     ((volatile AmpereAControlGPFifo *)c->userd.cpu)->GPPut = c->gpPut;
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
@@ -93,11 +101,15 @@ NV_STATUS chan_submit(Chan *c)
 
 bool chan_rewind(Chan *c)
 {
-    // the push buffer is linear: start over once the channel has fetched everything (GPGet == GPPut)
-    if (c->cur != c->segStart || chan_gpget(c) != c->gpPut) return false;
+    // the push buffer is linear: start over once the channel has fetched everything: GPGet == GPPut, or the caller saw its
+    // last submit complete. GPGet alone is not enough: on the RTX 5050 it still reads 0 three seconds after the work completed,
+    // and the buffer filled up after 64 KiB of commands (170 H.264, 199 AV1 or 292 VP9 frames, then writes past its end)
+    if (c->cur != c->segStart || (!c->settled && chan_gpget(c) != c->gpPut)) return false;
     c->cur = c->segStart = c->push.cpu;
     return true;
 }
+
+void chan_settled(Chan *c) { c->settled = true; }
 
 NvU32 chan_gpget(Chan *c) { return ((volatile AmpereAControlGPFifo *)c->userd.cpu)->GPGet; }
 NvU32 chan_error(Chan *c) { return ((volatile NvNotification *)c->notifier.cpu)[0].status; }
