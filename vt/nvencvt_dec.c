@@ -84,6 +84,7 @@ typedef struct {
     unsigned frames, errors;
     double tIn, tEngine, tPool, tCopy, tEmit, tOut, tLast;   // ms: inside decodeFrame, engine wait, pool, untile, emit; between calls
     uint8_t *tmp; size_t tmpCap;    // a non-contiguous sample, flattened
+    int qosTop, qosLevel, qosHot, qosCool; double qosT0, qosIn0; bool qosOff;   // real-time playback beyond the engine (qos_hevc)
     // asynchronous output (T8.09): pictures waiting for the output thread (copy, emit, release), in decode order
     struct OutJob { VTVideoDecoderFrame frame; OSStatus res; VTDecodeInfoFlags fl; CVPixelBufferRef pb; int surf, rel; unsigned w, h, cx, cy, usCopy, usEmit; } q[4];
     unsigned qh, qt; bool async, thrOn, stop; pthread_t thr; pthread_cond_t cv;
@@ -311,7 +312,7 @@ static OSStatus start_hevc(DState *s, VTVideoDecoderSession session, CMVideoForm
     if (st || !count) { DLOG("startSession: no HEVC parameter sets (%d)", (int)st); return kVTVideoDecoderBadDataErr; }
     s->nalLen = nalLen;
     HevcParams *pp = calloc(1, sizeof *pp); if (!pp) return kVTVideoDecoderMalfunctionErr;
-    unsigned W = 0, H = 0; int depth = 0, cdepth = 0, cf = -1, cw = 0, ch = 0; bool full = false;
+    unsigned W = 0, H = 0; int depth = 0, cdepth = 0, cf = -1, cw = 0, ch = 0, topTid = 0; bool full = false;
     for (size_t i = 0; i < count; i++) {
         const uint8_t *ps; size_t n;
         if (CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(fmt, i, &ps, &n, NULL, NULL) || n < 2 || ((ps[0] >> 1) & 63) != HEVC_NAL_SPS) continue;
@@ -320,7 +321,7 @@ static OSStatus start_hevc(DState *s, VTVideoDecoderSession session, CMVideoForm
         if ((unsigned)sp->width > W) W = (unsigned)sp->width;
         if ((unsigned)sp->height > H) H = (unsigned)sp->height;
         if (cf < 0) {
-            depth = sp->bit_depth_luma; cdepth = sp->bit_depth_chroma; cf = sp->chroma_format_idc; full = sp->video_full_range_flag;
+            depth = sp->bit_depth_luma; cdepth = sp->bit_depth_chroma; cf = sp->chroma_format_idc; full = sp->video_full_range_flag; topTid = sp->max_sub_layers_minus1;
             cw = sp->width - sp->conf_win_left - sp->conf_win_right; ch = sp->height - sp->conf_win_top - sp->conf_win_bottom;
         }
     }
@@ -328,7 +329,7 @@ static OSStatus start_hevc(DState *s, VTVideoDecoderSession session, CMVideoForm
     const bool ok = cf >= 0 && (cf == 1 || cf == 3) && (depth == 8 || depth == 10) && cdepth == depth && W <= 8192 && H <= 8192;
     DLOG("startSession: HEVC %dx%d (coded %ux%u), %d-bit, chroma %d, %s range%s", cw, ch, W, H, depth, cf, full ? "full" : "video", ok ? "" : " - NOT SUPPORTED");
     if (!ok) return kVTVideoDecoderUnsupportedDataFormatErr;
-    s->w = cw; s->h = ch;
+    s->w = cw; s->h = ch; s->qosTop = topTid; s->qosOff = getenv("NVDEC_NOQOS") != NULL;
     if (!(s->hevc = calloc(1, sizeof *s->hevc)) || rm_open(&s->rm) || rm_va_init(&s->rm) || hevcdec_open(s->hevc, &s->rm, W, H, depth, cf)) {
         DLOG("startSession: NVDEC session failed"); free(s->hevc); s->hevc = NULL; return kVTVideoDecoderMalfunctionErr;
     }
@@ -698,6 +699,34 @@ static OSStatus decode_av1(DState *s, VTVideoDecoderFrame frame, const uint8_t *
     return res;
 }
 
+// Real-time playback beyond what NVDEC can do. macOS's Aerial wallpapers are 4K 10-bit HEVC at 240 pictures a second, which the
+// RTX 5050 decodes at about 105. A player at 1x hands over the next picture as soon as the last returned, so the engine and the CPU
+// never rest while nearly every picture comes too late to be shown: 6 of the 105 each second. When a client playing in
+// real time keeps decodeFrame busy, the top temporal sub-layer goes, then the next (those pictures are reported dropped); when
+// it is far from busy, one comes back. Decided on the time decodeFrame took between its calls, whatever the playback rate.
+// NVDEC_NOQOS=1 leaves it out. While it keeps up, the pictures are also copied on one thread: 4K 10-bit at 60 pictures a second
+// costs 32 % of a core instead of 53 % on four, the same work in less time being of no use here.
+enum { QOS_WINDOW_MS = 250, QOS_HOT_WINDOWS = 2, QOS_COOL_WINDOWS = 4, QOS_SETTLE_WINDOWS = 4 };
+static void qos_hevc(DState *s, VTDecodeFrameFlags flags, double now)
+{
+    if (!s->hevc) return;
+    if (!(flags & kVTDecodeFrame_1xRealTimePlayback)) { s->hevc->max_tid = HEVC_ALL_TIDS; s->hevc->copy_threads = 0; s->qosT0 = 0; return; }
+    if (!s->qosT0) { s->qosT0 = now; s->qosIn0 = s->tIn; }
+    else if (now - s->qosT0 >= QOS_WINDOW_MS) {
+        const double busy = (s->tIn - s->qosIn0) / (now - s->qosT0);
+        s->qosT0 = now; s->qosIn0 = s->tIn;
+        s->hevc->copy_threads = busy < 0.8 ? 1 : 0;
+        if (busy > 0.9) {           // after a change the player is still catching up: it gets its time first
+            s->qosCool = 0;
+            if (++s->qosHot >= QOS_HOT_WINDOWS && s->qosLevel < s->qosTop && !s->qosOff) { s->qosLevel++; s->qosHot = -QOS_SETTLE_WINDOWS; DLOG("real time: decodeFrame busy %.0f %%, sub-layers up to %d", busy * 100, s->qosTop - s->qosLevel); }
+        } else if (busy < 0.35) {   // twice the pictures would still fit
+            if (s->qosHot > 0) s->qosHot = 0;
+            if (++s->qosCool >= QOS_COOL_WINDOWS && s->qosLevel > 0) { s->qosLevel--; s->qosCool = 0; DLOG("real time: decodeFrame busy %.0f %%, sub-layers up to %d", busy * 100, s->qosTop - s->qosLevel); }
+        } else { if (s->qosHot > 0) s->qosHot = 0; s->qosCool = 0; }
+    }
+    s->hevc->max_tid = s->qosLevel ? s->qosTop - s->qosLevel : HEVC_ALL_TIDS;
+}
+
 // HEVC: one sample is one access unit (one picture), emitted in decode order like H.264's. A picture not to be output
 // (pic_output_flag 0, or a RASL picture after the CRA decoding started at, which is skipped) is reported dropped.
 static OSStatus decode_hevc(DState *s, VTVideoDecoderFrame frame, const uint8_t *p, size_t len)
@@ -789,6 +818,7 @@ static OSStatus d_decodeFrame(VTVideoDecoderRef o, VTVideoDecoderFrame frame, CM
     s->async = (flags & kVTDecodeFrame_EnableAsynchronousDecompression) && s->opened && !getenv("NVDEC_SYNC") && out_async_ok(s);
     if (s->async && info) *info |= kVTDecodeInfo_Asynchronous;
     if (s->tLast > 0) s->tOut += tA - s->tLast;
+    qos_hevc(s, flags, tA);
     OSStatus res = noErr; CVPixelBufferRef pb = NULL;
     CMBlockBufferRef bb = CMSampleBufferGetDataBuffer(sb);
     size_t len = bb ? CMBlockBufferGetDataLength(bb) : 0, avail = 0; char *p = NULL;
