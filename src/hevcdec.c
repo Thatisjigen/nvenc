@@ -69,11 +69,19 @@ int hevcdec_open(HevcDec *d, Rm *rm, unsigned maxW, unsigned maxH, int bit_depth
         memset(b[i].m->cpu, 0, b[i].m->size);
     }
     const size_t ch = chroma_format == 1 ? d->maxH / 2 : d->maxH;
-    const size_t luma = nvenc_in_plane_size(d->pitch, d->maxH) + 65536, chroma = nvenc_in_plane_size(d->pitch * (chroma_format == 3 ? 2 : 1), ch) + 65536;
-    for (int i = 0; i < HEVC_SURFACES; i++)
-        if (rm_mem_alloc(rm, &d->luma[i], (luma + 0xfff) & ~(size_t)0xfff, 0x1000, true, true, true) ||
-            rm_mem_alloc(rm, &d->chroma[i], (chroma + 0xfff) & ~(size_t)0xfff, 0x1000, true, true, true)) { fprintf(stderr, "hevcdec: surface alloc failed\n"); return -1; }
+    d->luma_size = (nvenc_in_plane_size(d->pitch, d->maxH) + 65536 + 0xfff) & ~(size_t)0xfff;
+    d->chroma_size = (nvenc_in_plane_size(d->pitch * (chroma_format == 3 ? 2 : 1), ch) + 65536 + 0xfff) & ~(size_t)0xfff;
     chan_mthd(&d->chan, 0, NVC56F_SET_OBJECT, 1, rm_class(rm, RM_CLS_NVDEC));
+    return 0;
+}
+
+// A picture's surfaces come when it is first used: 4K 10-bit pictures take 25 MB of wired memory each and a session needs far fewer
+// than the engine's 16 slots. macOS opens a dozen sessions for a wallpaper, most of them for a picture or two.
+static int surface_ready(HevcDec *d, int i)
+{
+    if (d->luma[i].cpu) return 0;
+    if (rm_mem_alloc(d->rm, &d->luma[i], d->luma_size, 0x1000, true, true, true)) return -1;
+    if (rm_mem_alloc(d->rm, &d->chroma[i], d->chroma_size, 0x1000, true, true, true)) { rm_mem_free(d->rm, &d->luma[i]); return -1; }
     return 0;
 }
 
@@ -223,6 +231,7 @@ static int decode_pending(HevcDec *d)
     int surf = -1;
     for (int i = 0; i < HEVC_SURFACES && surf < 0; i++) if (!d->busy[i] && !d->ref[i]) surf = i;
     if (surf < 0) { fprintf(stderr, "hevcdec: no free surface (the caller holds too many)\n"); return -1; }
+    if (surface_ready(d, surf)) { fprintf(stderr, "hevcdec: surface alloc failed\n"); return -1; }
 
     memcpy(d->bs.cpu, d->au, d->auN);
     const int ctb = 1 << sps->log2_max_cb;
@@ -359,9 +368,10 @@ static int decode_pending(HevcDec *d)
     chan_mthd(c, 0, NVC9B0_HEVC_SET_FILTER_BUFFER_OFFSET, 1, hi(d->filter.gpu));
     chan_mthd(c, 0, NVC9B0_HEVC_SET_SAO_BUFFER_OFFSET, 1, hi(d->filter.gpu + d->flt_sao));
     chan_mthd(c, 0, NVC9B0_HEVC_SET_SLICE_INFO_BUFFER_OFFSET, 1, hi(d->slinfo.gpu));
-    for (int i = 0; i < HEVC_SURFACES; i++) {
-        chan_mthd(c, 0, NVC9B0_SET_PICTURE_LUMA_OFFSET0 + 4 * (NvU32)i, 1, hi(d->luma[i].gpu));
-        chan_mthd(c, 0, NVC9B0_SET_PICTURE_CHROMA_OFFSET0 + 4 * (NvU32)i, 1, hi(d->chroma[i].gpu));
+    for (int i = 0; i < HEVC_SURFACES; i++) {   // a slot not in use yet: the first one, always there (a free slot is the lowest)
+        const int k = d->luma[i].cpu ? i : 0;
+        chan_mthd(c, 0, NVC9B0_SET_PICTURE_LUMA_OFFSET0 + 4 * (NvU32)i, 1, hi(d->luma[k].gpu));
+        chan_mthd(c, 0, NVC9B0_SET_PICTURE_CHROMA_OFFSET0 + 4 * (NvU32)i, 1, hi(d->chroma[k].gpu));
     }
     chan_mthd(c, 0, NVC9B0_EXECUTE, 1, 0u);
     const NvU32 val = ++d->semval; volatile NvU32 *sv = d->sem.cpu;

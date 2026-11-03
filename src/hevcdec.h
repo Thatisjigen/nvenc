@@ -19,7 +19,8 @@ typedef struct {
     RmMem setup, bs, scaling, tiles, filter, coloc, intra, slinfo, status, sem;
     RmMem bw4dc;                    // Blackwell (NVDEC 0xcfb0): the buffer of method 0x4dc
     size_t colmv_size, flt_sao, flt_bsd, flt_above, flt_sao_above, flt_edge;
-    RmMem luma[HEVC_SURFACES], chroma[HEVC_SURFACES];
+    RmMem luma[HEVC_SURFACES], chroma[HEVC_SURFACES];   // made when first used (surface_ready)
+    size_t luma_size, chroma_size;
     // per surface
     int poc[HEVC_SURFACES];
     int ref[HEVC_SURFACES];         // 0 unused for reference, 1 short-term, 2 long-term
