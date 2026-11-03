@@ -133,17 +133,52 @@ static void untile_band(uint8_t *dst, size_t dst_stride, const uint8_t *src, siz
     }
     if (full * 64 < width) untile_band_slow(dst, dst_stride, src, full * 64, width, y0, y1, pitch);
 }
-void nvenc_in_untile_plane(uint8_t *dst, size_t dst_stride, const uint8_t *src, size_t width, size_t rows, size_t pitch)
+// The same for a destination whose rows start on cache lines, by whole lines with non-temporal stores: plain stores made the CPU
+// read every destination line from memory first, only to overwrite it. Each tile goes through a small buffer in row order, as
+// the lines of a row are not next to each other in the tile, and a partly written line would be flushed in pieces.
+static void untile_band_nt(uint8_t *dst, size_t dst_stride, const uint8_t *src, size_t width, size_t band, size_t rows, size_t pitch)
+{
+    const size_t y0 = band * 16, y1 = y0 + 16 < rows ? y0 + 16 : rows;
+    if (y1 - y0 < 16) { untile_band_slow(dst, dst_stride, src, 0, width, y0, y1, pitch); return; }
+    const size_t full = width / 64;
+    uint8_t *d0 = dst + y0 * dst_stride;
+    __m128i t[16][4];
+    for (size_t k = 0; k < full; k++) {
+        const __m128i *s = (const __m128i *)(src + band * pitch * 16 + k * 1024);
+        for (int y8 = 0; y8 < 2; y8++)
+            for (int x32 = 0; x32 < 2; x32++)
+                for (int y4 = 0; y4 < 2; y4++)
+                    for (int x16 = 0; x16 < 2; x16++) {
+                        __m128i (*r)[4] = &t[y8 * 8 + y4 * 4];
+                        const int c = x32 * 2 + x16;
+                        r[0][c] = _mm_load_si128(s++); r[1][c] = _mm_load_si128(s++); r[2][c] = _mm_load_si128(s++); r[3][c] = _mm_load_si128(s++);
+                    }
+        uint8_t *d = d0 + k * 64;
+        for (int y = 0; y < 16; y++, d += dst_stride)
+            for (int c = 0; c < 4; c++) _mm_stream_si128((__m128i *)d + c, t[y][c]);
+    }
+    if (full * 64 < width) untile_band_slow(dst, dst_stride, src, full * 64, width, y0, y1, pitch);
+}
+void nvenc_in_untile_plane_n(uint8_t *dst, size_t dst_stride, const uint8_t *src, size_t width, size_t rows, size_t pitch, unsigned threads)
 {
     size_t bands = (rows + 15) / 16;
     if ((uintptr_t)src & 15) { untile_band_slow(dst, dst_stride, src, 0, width, 0, rows, pitch); return; }
     if (bands >= 32) {
         // memory-bound: 4K NV12 into a VideoToolbox pool buffer took 6.7 ms with 1 thread, 4.7 with 2, 3.4 with 4, 3.8 with 6-8 (T11.05)
-        const size_t chunks = 4, per = (bands + chunks - 1) / chunks;
+        const size_t chunks = threads ? threads : 4, per = (bands + chunks - 1) / chunks;
+        const bool nt = !((uintptr_t)dst & 63) && !(dst_stride & 63);
         dispatch_apply(chunks, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^(size_t k) {
-            for (size_t b = k * per; b < (k + 1) * per && b < bands; b++) untile_band(dst, dst_stride, src, width, b, rows, pitch); });
+            for (size_t b = k * per; b < (k + 1) * per && b < bands; b++) {
+                if (nt) untile_band_nt(dst, dst_stride, src, width, b, rows, pitch);
+                else untile_band(dst, dst_stride, src, width, b, rows, pitch);
+            } });
+        if (nt) _mm_sfence();
     } else
         for (size_t b = 0; b < bands; b++) untile_band(dst, dst_stride, src, width, b, rows, pitch);
+}
+void nvenc_in_untile_plane(uint8_t *dst, size_t dst_stride, const uint8_t *src, size_t width, size_t rows, size_t pitch)
+{
+    nvenc_in_untile_plane_n(dst, dst_stride, src, width, rows, pitch, 0);
 }
 
 static void tile_band_slow(uint8_t *dst, const uint8_t *src, size_t src_stride, size_t x0, size_t width, size_t y0, size_t y1, size_t pitch)
