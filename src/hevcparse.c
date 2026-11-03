@@ -204,7 +204,7 @@ static int st_ref_pic_set(Br *r, HevcStRps *sets, int idx, int num_sets, HevcStR
 // ---- SPS (7.3.2.2) ----
 int hevc_parse_sps(HevcParams *p, const uint8_t *nal, size_t len)
 {
-    static Br r; br_init(&r, nal, len);
+    static _Thread_local Br r; br_init(&r, nal, len);
     HevcSps s; memset(&s, 0, sizeof s);
     s.vps_id = (int)u(&r, 4); s.max_sub_layers_minus1 = (int)u(&r, 3); u1(&r);
     profile_tier_level(&r, &s, s.max_sub_layers_minus1);
@@ -272,7 +272,7 @@ int hevc_parse_sps(HevcParams *p, const uint8_t *nal, size_t len)
 // ---- PPS (7.3.2.3) ----
 int hevc_parse_pps(HevcParams *p, const uint8_t *nal, size_t len)
 {
-    static Br r; br_init(&r, nal, len);
+    static _Thread_local Br r; br_init(&r, nal, len);
     HevcPps q; memset(&q, 0, sizeof q);
     q.pps_id = (int)ue(&r); q.sps_id = (int)ue(&r);
     if (q.pps_id > 63 || q.sps_id > 15) return -1;
@@ -363,7 +363,7 @@ static void pred_weight_table(Br *r, const HevcSps *sps, const HevcSlice *s)
 
 int hevc_parse_slice_header(const HevcParams *p, const uint8_t *nal, size_t len, HevcSlice *s)
 {
-    static Br r; br_init(&r, nal, len);
+    static _Thread_local Br r; br_init(&r, nal, len);
     memset(s, 0, sizeof *s);
     if (len < 2) return -1;
     s->nal_type = (nal[0] >> 1) & 63; s->temporal_id = (nal[1] & 7) - 1;

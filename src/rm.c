@@ -238,7 +238,7 @@ NvU32 rm_class(Rm *rm, int kind)
             { 0xcfb0, 0xc9b0, 0xc7b0, 0xc6b0, 0xc5b0, 0xc4b0, 0xc3b0 },     // NVDEC (0xcfb0: Blackwell GB20x)
             { 0xca6f, 0xc96f, 0xc56f, 0xc46f, 0xc36f },                     // GPFIFO: Blackwell B / A (what NVK takes there), Ampere, Turing, Volta
             { 0xc561, 0xc461, 0xc361 } };                                   // usermode (doorbell page)
-        static NV0080_CTRL_GPU_GET_CLASSLIST_V2_PARAMS cl; memset(&cl, 0, sizeof cl);
+        static _Thread_local NV0080_CTRL_GPU_GET_CLASSLIST_V2_PARAMS cl; memset(&cl, 0, sizeof cl);
         if (rm_ctrl(rm, rm->device, NV0080_CTRL_CMD_GPU_GET_CLASSLIST_V2, &cl, sizeof cl) == NV_OK)
             for (int k = 0; k < 4; k++)
                 for (int w = 0; w < 8 && want[k][w] && !rm->cls[k]; w++)

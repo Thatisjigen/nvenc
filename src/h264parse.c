@@ -126,7 +126,7 @@ static void vui(Br *r, H264Sps *s)
 // ---- SPS (7.3.2.1.1) ----
 int h264_parse_sps(H264Params *p, const uint8_t *nal, size_t len)
 {
-    static Br r; br_init(&r, nal, len);
+    static _Thread_local Br r; br_init(&r, nal, len);
     H264Sps s; memset(&s, 0, sizeof s);
     s.profile_idc = (int)u(&r, 8); s.constraint_flags = (int)u(&r, 8); s.level_idc = (int)u(&r, 8);
     s.sps_id = (int)ue(&r);
@@ -174,7 +174,7 @@ int h264_parse_sps(H264Params *p, const uint8_t *nal, size_t len)
 // ---- PPS (7.3.2.2) ----
 int h264_parse_pps(H264Params *p, const uint8_t *nal, size_t len)
 {
-    static Br r; br_init(&r, nal, len);
+    static _Thread_local Br r; br_init(&r, nal, len);
     H264Pps q; memset(&q, 0, sizeof q);
     q.pps_id = (int)ue(&r); q.sps_id = (int)ue(&r);
     if (q.pps_id > 255 || q.sps_id > 31 || !p->sps[q.sps_id].valid) return -1;
@@ -212,7 +212,7 @@ int h264_parse_pps(H264Params *p, const uint8_t *nal, size_t len)
 // ---- slice header (7.3.3), up to dec_ref_pic_marking ----
 int h264_parse_slice_header(const H264Params *p, const uint8_t *nal, size_t len, H264Slice *o)
 {
-    static Br r; br_init(&r, nal, len);
+    static _Thread_local Br r; br_init(&r, nal, len);
     memset(o, 0, sizeof *o);
     o->nal_ref_idc = nal[0] >> 5 & 3; o->nal_unit_type = nal[0] & 31; o->idr = o->nal_unit_type == H264_NAL_IDR;
     o->first_mb_in_slice = (int)ue(&r); o->slice_type = (int)(ue(&r) % 5); o->pps_id = (int)ue(&r);
