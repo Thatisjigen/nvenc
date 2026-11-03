@@ -9,6 +9,7 @@
 #include "hevcparse.h"
 
 enum { HEVC_SURFACES = 16 };      // picture slots: the engine's reference arrays have 16 entries
+enum { HEVC_ALL_TIDS = 7 };
 
 typedef struct {
     Rm *rm; Chan chan;
@@ -31,6 +32,8 @@ typedef struct {
     bool blackwell;                 // NVDEC 0xcfb0 (RTX 50): method 0x4dc and a setup word past Ada's struct
     // the picture just decoded
     int cur_surf, cur_poc, cur_w, cur_h, cur_crop[4];   // crop: left, right, top, bottom (luma samples)
+    int max_tid, tid_limit;         // VCL NAL units above this TemporalId are left out: the wanted limit, the one in force
+    int copy_threads;               // threads for hevcdec_read_nv12 (0: as many as help)
     bool cur_output;                // pic_output_flag (and not a skipped RASL picture)
     bool cur_irap_nro;              // an IRAP with NoRaslOutputFlag: pictures waiting for output before it come first,
     bool cur_no_output_prior;       // or, with NoOutputOfPriorPicsFlag, are discarded (C.5.2.2)

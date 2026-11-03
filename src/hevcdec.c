@@ -26,7 +26,7 @@ int hevcdec_open(HevcDec *d, Rm *rm, unsigned maxW, unsigned maxH, int bit_depth
     d->rm = rm; d->maxW = (maxW + 63) & ~63u; d->maxH = (maxH + 63) & ~63u;
     d->bit_depth = bit_depth; d->bps = bit_depth > 8 ? 2 : 1; d->chroma_format = chroma_format;
     d->pitch = (size_t)d->maxW * (size_t)d->bps;
-    d->first_pic = true; d->after_eos = true;
+    d->first_pic = true; d->after_eos = true; d->max_tid = d->tid_limit = HEVC_ALL_TIDS;
     NV_NVDEC_ALLOCATION_PARAMETERS dp = { .size = sizeof dp, .prohibitMultipleInstances = 0, .engineInstance = 0 };
     d->turing = rm_class(rm, RM_CLS_NVDEC) == 0xc4b0;
     d->blackwell = rm_class(rm, RM_CLS_NVDEC) == 0xcfb0;
@@ -100,8 +100,8 @@ void hevcdec_read_nv12(HevcDec *d, int surf, uint8_t *y, size_t ystride, uint8_t
     const size_t b = (size_t)d->bps, cp = d->chroma_format == 3 ? 2 * d->pitch : d->pitch;
     const unsigned cw = d->chroma_format == 3 ? w : (w + 1) / 2, ch = d->chroma_format == 3 ? h : (h + 1) / 2;
     if (!x0 && !y0) {
-        nvenc_in_untile_plane(y, ystride, d->luma[surf].cpu, w * b, h, d->pitch);
-        nvenc_in_untile_plane(uv, uvstride, d->chroma[surf].cpu, 2 * cw * b, ch, cp);
+        nvenc_in_untile_plane_n(y, ystride, d->luma[surf].cpu, w * b, h, d->pitch, d->copy_threads);
+        nvenc_in_untile_plane_n(uv, uvstride, d->chroma[surf].cpu, 2 * cw * b, ch, cp, d->copy_threads);
         return;
     }
     // a conformance window that crops the left / top: sample by sample (rare)
@@ -403,6 +403,16 @@ int hevcdec_nal(HevcDec *d, const uint8_t *nal, size_t len)
     if (layer) return 0;                                       // base layer only
     if (t <= HEVC_NAL_RSV_IRAP_23) {
         if (t > HEVC_NAL_CRA || (t >= 10 && t <= 15)) return 0;   // reserved types
+        // sub-bitstream extraction (10.1): without the sub-layers above a limit the rest is still a conforming stream. No picture left
+        // refers to those that go, at most keeps them in its RPS as "foll", which apply_rps does not count as missing. The limit
+        // goes down at any picture, up only where nothing later depends on what was left out: an IRAP, or for one sub-layer
+        // its TSA and STSA pictures (7.4.2.2).
+        const int tid = (nal[1] & 7) - 1;
+        if (d->tid_limit != d->max_tid && len > 2 && (nal[2] & 0x80)) {   // first_slice_segment_in_pic_flag
+            if (d->max_tid < d->tid_limit || hevc_is_irap(t)) d->tid_limit = d->max_tid;
+            else if (tid == d->tid_limit + 1 && t >= 2 && t <= 5) d->tid_limit = tid;
+        }
+        if (tid > d->tid_limit) return 0;
         HevcSlice s;
         if (hevc_parse_slice_header(&d->params, nal, len, &s)) { fprintf(stderr, "hevcdec: slice header parse failed\n"); return -1; }
         int r = 0;
