@@ -235,7 +235,7 @@ static void film_grain_setup(const Av1FilmGrain *g, int bd, av1_fgs_cfg_t *cfg, 
     }
     const int gmin = -(128 << (bd - 8)), gmax = (128 << (bd - 8)) - 1;
     const int shift = 12 - bd + g->grain_scale_shift, ar_shift = g->ar_coeff_shift_minus_6 + 6, lag = g->ar_coeff_lag;
-    static int luma[LUMA_W * LUMA_H], cb[CHROMA_W * CHROMA_H], cr[CHROMA_W * CHROMA_H];
+    static _Thread_local int luma[LUMA_W * LUMA_H], cb[CHROMA_W * CHROMA_H], cr[CHROMA_W * CHROMA_H];
     memset(luma, 0, sizeof luma);
     if (g->num_y_points > 0) {
         uint16_t r = (uint16_t)g->grain_seed;
@@ -636,7 +636,7 @@ int av1dec_tu(Av1Dec *d, const uint8_t *buf, size_t n)
             }
         } else if (o.type == AV1_OBU_TILE_GROUP && d->have_hdr) { tg = pl; tgn = o.payload_len; }
         if (tg) {
-            static Av1Tile tl[AV1_MAX_TILES]; int start; bool last;
+            static _Thread_local Av1Tile tl[AV1_MAX_TILES]; int start; bool last;
             const int nt = av1_parse_tile_group(&d->f, tg, tgn, tl, AV1_MAX_TILES, &start, &last);
             if (nt < 0) { fprintf(stderr, "av1dec: tile group error\n"); return -1; }
             for (int t = 0; t < nt; t++) {   // each tile's data, back to back in the bitstream buffer
