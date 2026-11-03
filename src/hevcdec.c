@@ -371,7 +371,7 @@ static int decode_pending(HevcDec *d)
     const double t0 = now_ms();
     memset(d->status.cpu, 0, sizeof(nvdec_status_s));
     chan_submit(c);
-    while (sv[0] != val && now_ms() - t0 < 3000) { }
+    chan_wait_sem(c, sv, val, 3000);
     d->engine_ms = now_ms() - t0;
     d->auN = 0;
     if (sv[0] != val) { fprintf(stderr, "hevcdec: no completion (error notifier 0x%x)\n", chan_error(c)); return -1; }

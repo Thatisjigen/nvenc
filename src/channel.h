@@ -15,6 +15,7 @@ typedef struct {
     bool settled;                      // the caller saw everything submitted so far complete (chan_settled)
     bool overrun;                      // commands dropped because the push buffer was full: the next chan_submit fails
     bool holdClocks; long heldUntil;   // RTX 50 decoders: GPU clocks held while frames come (hold_clocks)
+    uint64_t waitNs;                   // the shortest of the last waits, about (chan_wait_sem)
 } Chan;
 
 // engineType: NV2080_ENGINE_TYPE_*; objClass/objParams: the engine object (e.g. 0xc9b7 + NV_NVENC_ALLOCATION_PARAMETERS)
@@ -26,6 +27,8 @@ NV_STATUS chan_submit(Chan *c);                // everything since the last subm
 NvU32 chan_gpget(Chan *c);                     // how far the channel has fetched
 bool chan_rewind(Chan *c);                     // reuse the push buffer from its start (only when everything was fetched)
 void chan_settled(Chan *c);                    // the caller saw the completion of its last submit: everything was fetched
+// wait for the engine to release a semaphore with this value, sleeping meanwhile; false when it did not within timeout_ms
+bool chan_wait_sem(Chan *c, const volatile NvU32 *sem, NvU32 val, unsigned timeout_ms);
 size_t chan_push_used(Chan *c);                // bytes of push buffer in use
 NvU32 chan_error(Chan *c);                     // RM's error notifier status (0 = none)
 // the channel's last MMU fault (NV906F_CTRL_CMD_GET_MMU_FAULT_INFO; RM clears it on read)

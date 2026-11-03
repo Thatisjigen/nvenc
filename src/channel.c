@@ -135,6 +135,30 @@ bool chan_rewind(Chan *c)
 
 void chan_settled(Chan *c) { c->settled = true; }
 
+// The CPU has nothing to do while the engine works: polling all through it kept a core at 100 % during video (4K 10-bit HEVC on
+// the RTX 5050 takes 5 to 9 ms a picture; a third of the CPU cost of a frame). So sleep for most of the shortest time the
+// last pictures took, then in steps short enough not to hold the next one back (at most a sixteenth of the time spent so far).
+// The shortest and not the average: a picture that took a second must not put the next ones to sleep for long.
+static void sleep_ns(uint64_t ns) { struct timespec ts = { (time_t)(ns / 1000000000), (long)(ns % 1000000000) }; nanosleep(&ts, NULL); }
+bool chan_wait_sem(Chan *c, const volatile NvU32 *sem, NvU32 val, unsigned timeout_ms)
+{
+    if (*sem == val) return true;
+    const uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW), limit = t0 + (uint64_t)timeout_ms * 1000000;
+    const uint64_t first = c->waitNs / 8 * 7;
+    if (first > 50000) sleep_ns(first);
+    uint64_t now;
+    for (;;) {
+        now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        if (*sem == val) break;
+        if (now >= limit) return false;
+        const uint64_t step = (now - t0) / 16;
+        sleep_ns(step > 50000 ? step : 50000);
+    }
+    const uint64_t took = now - t0, grown = c->waitNs + c->waitNs / 32;   // upwards slowly
+    c->waitNs = !c->waitNs || took < grown ? took : grown;
+    return true;
+}
+
 NvU32 chan_gpget(Chan *c) { return ((volatile AmpereAControlGPFifo *)c->userd.cpu)->GPGet; }
 NvU32 chan_error(Chan *c) { return ((volatile NvNotification *)c->notifier.cpu)[0].status; }
 
