@@ -56,13 +56,11 @@ int hevcdec_open(HevcDec *d, Rm *rm, unsigned maxW, unsigned maxH, int bit_depth
     if (d->turing && flt < d->flt_above + turingA) flt = d->flt_above + NVDEC_ALIGN(turingA);
     d->auCap = (size_t)d->maxW * d->maxH * 2 > (4u << 20) ? (size_t)d->maxW * d->maxH * 2 : (4u << 20);
     if (!(d->au = malloc(d->auCap))) return -1;
+    d->flt_size = flt;
+    d->bw4dc_size = d->blackwell ? ((size_t)1 << 20) + (size_t)d->maxW * 256 * (size_t)d->bps * (chroma_format == 3 ? 2 : 1) : 0;
     struct { RmMem *m; size_t size; } b[] = {
-        { &d->setup, 0x2000 }, { &d->bs, d->auCap + 0x1000 }, { &d->scaling, 0x1000 }, { &d->tiles, 0x1000 },
-        { &d->filter, flt }, { &d->coloc, d->colmv_size * HEVC_SURFACES }, { &d->intra, (size_t)d->maxW * 8 * (size_t)d->bps },
-        { &d->slinfo, 0x10000 }, { &d->status, 0x1000 }, { &d->sem, 0x1000 },
-        // Blackwell's engine does not complete a picture until method 0x4dc (not in clc9b0.h; NullMoth's decoder sets it
-        // on the RTX 5050) points at a buffer. At 1920x1088 8-bit it wrote 11.5 KB of it; give it 1 MB plus 256 bytes per column
-        { &d->bw4dc, d->blackwell ? ((size_t)1 << 20) + (size_t)d->maxW * 256 * (size_t)d->bps * (chroma_format == 3 ? 2 : 1) : 0 } };
+        { &d->setup, 0x2000 }, { &d->scaling, 0x1000 }, { &d->tiles, 0x1000 },
+        { &d->intra, (size_t)d->maxW * 8 * (size_t)d->bps }, { &d->slinfo, 0x10000 }, { &d->status, 0x1000 }, { &d->sem, 0x1000 } };
     for (size_t i = 0; i < sizeof b / sizeof b[0]; i++) {
         if (!b[i].size) continue;
         if (rm_mem_alloc(rm, b[i].m, (b[i].size + 0xfff) & ~(size_t)0xfff, 0x1000, true, true, true)) { fprintf(stderr, "hevcdec: alloc failed\n"); return -1; }
@@ -72,6 +70,24 @@ int hevcdec_open(HevcDec *d, Rm *rm, unsigned maxW, unsigned maxH, int bit_depth
     d->luma_size = (nvenc_in_plane_size(d->pitch, d->maxH) + 65536 + 0xfff) & ~(size_t)0xfff;
     d->chroma_size = (nvenc_in_plane_size(d->pitch * (chroma_format == 3 ? 2 : 1), ch) + 65536 + 0xfff) & ~(size_t)0xfff;
     chan_mthd(&d->chan, 0, NVC56F_SET_OBJECT, 1, rm_class(rm, RM_CLS_NVDEC));
+    return 0;
+}
+
+// The big working buffers come with the first picture: 90 MB at 4K, and a session that only joins another's decoder never needs them.
+// Opening a session took over 200 ms, most of it here, and macOS opens a dozen for a wallpaper.
+static int big_buffers_ready(HevcDec *d)
+{
+    if (d->bs.cpu) return 0;
+    struct { RmMem *m; size_t size; } b[] = {
+        { &d->bs, d->auCap + 0x1000 }, { &d->filter, d->flt_size }, { &d->coloc, d->colmv_size * HEVC_SURFACES },
+        // Blackwell's engine does not complete a picture until method 0x4dc (not in clc9b0.h; NullMoth's decoder sets it
+        // on the RTX 5050) points at a buffer. At 1920x1088 8-bit it wrote 11.5 KB of it; give it 1 MB plus 256 bytes per column
+        { &d->bw4dc, d->bw4dc_size } };
+    for (size_t i = 0; i < sizeof b / sizeof b[0]; i++) {
+        if (!b[i].size) continue;
+        if (rm_mem_alloc(d->rm, b[i].m, (b[i].size + 0xfff) & ~(size_t)0xfff, 0x1000, true, true, true)) return -1;
+        memset(b[i].m->cpu, 0, b[i].m->size);
+    }
     return 0;
 }
 
@@ -231,7 +247,7 @@ static int decode_pending(HevcDec *d)
     int surf = -1;
     for (int i = 0; i < HEVC_SURFACES && surf < 0; i++) if (!d->busy[i] && !d->ref[i]) surf = i;
     if (surf < 0) { fprintf(stderr, "hevcdec: no free surface (the caller holds too many)\n"); return -1; }
-    if (surface_ready(d, surf)) { fprintf(stderr, "hevcdec: surface alloc failed\n"); return -1; }
+    if (big_buffers_ready(d) || surface_ready(d, surf)) { fprintf(stderr, "hevcdec: alloc failed\n"); return -1; }
 
     memcpy(d->bs.cpu, d->au, d->auN);
     const int ctb = 1 << sps->log2_max_cb;
