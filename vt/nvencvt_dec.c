@@ -74,7 +74,8 @@ typedef struct {
     Rm rm; H264Dec dec; bool opened;
     Rm *vrm; Vp9Dec *vp9;           // VP9: on the heap, so that the next session can take them over (park_vp9)
     Av1Dec *av1;                    // AV1: likewise (with vrm)
-    HevcDec *hevc;                  // HEVC (with rm)
+    HevcDec *hevc;                  // HEVC: the decoder of its group (HevcGroup)
+    struct HevcGroup *grp; uint64_t chain, seen; bool chainStarted, waitIrap, stale;
     Mpeg2Dec *m2;                   // MPEG-1/2 (with rm)
     Mpeg4Dec *m4;                   // MPEG-4 Part 2 (with rm)
     int nalLen, w, h;
@@ -84,7 +85,8 @@ typedef struct {
     unsigned frames, errors;
     double tIn, tEngine, tPool, tCopy, tEmit, tOut, tLast;   // ms: inside decodeFrame, engine wait, pool, untile, emit; between calls
     uint8_t *tmp; size_t tmpCap;    // a non-contiguous sample, flattened
-    int qosTop, qosLevel, qosHot, qosCool; double qosT0, qosIn0; bool qosOff;   // real-time playback beyond the engine (qos_hevc)
+    bool qosOff;                    // real-time playback beyond the engine (qos_hevc, its state in the group)
+    unsigned W, H; int depth, cf, topTid; uint64_t streamId;   // HEVC: what a decoder of its own would be made with
     // asynchronous output (T8.09): pictures waiting for the output thread (copy, emit, release), in decode order
     struct OutJob { VTVideoDecoderFrame frame; OSStatus res; VTDecodeInfoFlags fl; CVPixelBufferRef pb; int surf, rel; unsigned w, h, cx, cy, usCopy, usEmit; } q[4];
     unsigned qh, qt; bool async, thrOn, stop; pthread_t thr; pthread_cond_t cv;
@@ -170,6 +172,113 @@ static int open_vp9(DState *s, unsigned w, unsigned h, int depth)
     return 0;
 }
 
+// ---- HEVC sessions that decode the same stream share one decoder ----
+// macOS's Aerial wallpaper plays one session per display, all of the same 4K 10-bit movie at the same time. Each picture was decoded and
+// copied three times, which takes most of what NVDEC can do on the RTX 5050. Here the first session to reach a picture
+// decodes and copies it, and the others get the same pixel buffer. What a decoder puts out depends only on the samples since the
+// last IDR, so a session is known to want the same picture by a hash of them. A session that is out of step (it seeks, or fell behind
+// by more than the pictures kept) leaves for a decoder of its own, from the next IRAP. Only in the processes named by
+// NVDEC_SHARE (default: the wallpaper and the Displays pane; 0: none; 1: all): anything else keeps one decoder per session.
+enum { GROUP_RING = 64, GROUP_PICS = 12, GROUP_MEMBERS = 8, GROUP_OPEN_MS = 2000, GROUP_WAIT_MS = 100 };
+typedef struct HevcGroup {
+    struct HevcGroup *next; unsigned refs;
+    DState *member[GROUP_MEMBERS];  // its sessions: the one that decodes waits a moment for one about to lose a picture it has not had
+    Rm rm; HevcDec dec;
+    uint64_t id;                    // the stream: parameter sets and what the session asks for
+    uint64_t head;                  // the chain after the last sample decoded
+    bool decoding; uint64_t decodingKey;
+    struct { uint64_t key, seq; CVPixelBufferRef pb; OSStatus res; VTDecodeInfoFlags fl; } ring[GROUP_RING]; uint64_t seq;   // pictures only for the last GROUP_PICS
+    double born, tBusy;             // when it was made; ms spent decoding
+    int qosTop, qosLevel, qosHot, qosCool; double qosT0, qosBusy0;
+} HevcGroup;
+static pthread_mutex_t gGroupLock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t gGroupCv = PTHREAD_COND_INITIALIZER;
+static HevcGroup *gGroups;
+
+static uint64_t hash_bytes(uint64_t x, const uint8_t *p, size_t n)
+{
+    for (; n >= 8; p += 8, n -= 8) { uint64_t v; memcpy(&v, p, 8); x = (x ^ v) * 0x9E3779B97F4A7C15ull; x ^= x >> 29; }
+    for (; n; p++, n--) x = (x ^ *p) * 0x100000001B3ull;
+    return x;
+}
+static bool share_here(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("NVDEC_SHARE"), *me = getprogname();
+        on = e ? strcmp(e, "0") != 0 && (!strcmp(e, "1") || strstr(e, me) != NULL) : !strcmp(me, "WallpaperAerialsExtension") || !strcmp(me, "DisplaysExt");
+    }
+    return on == 1;
+}
+// a group is open to other sessions, and keeps the pictures for them, for its first moments and while it has more than one session
+static bool group_open(const HevcGroup *g, double now) { return share_here() && (g->refs > 1 || now - g->born < GROUP_OPEN_MS); }
+// the oldest entry with a picture when another one would push it out, else -1
+static int group_ring_full(const HevcGroup *g)   // gGroupLock held
+{
+    int n = 0, old = -1;
+    for (int i = 0; i < GROUP_RING; i++) if (g->ring[i].pb) { n++; if (old < 0 || g->ring[i].seq < g->ring[old].seq) old = i; }
+    return n >= GROUP_PICS ? old : -1;
+}
+static uint64_t group_ring_put(HevcGroup *g, uint64_t key, CVPixelBufferRef pb, OSStatus res, VTDecodeInfoFlags fl)   // gGroupLock held
+{
+    int full = pb ? group_ring_full(g) : -1;
+    if (full >= 0) { CVPixelBufferRelease(g->ring[full].pb); g->ring[full].pb = NULL; g->ring[full].key = 0; }
+    const uint64_t seq = ++g->seq; const unsigned i = (unsigned)(seq % GROUP_RING);
+    if (g->ring[i].pb) CVPixelBufferRelease(g->ring[i].pb);
+    g->ring[i].key = key; g->ring[i].seq = seq; g->ring[i].pb = pb ? CVPixelBufferRetain(pb) : NULL; g->ring[i].res = res; g->ring[i].fl = fl;
+    return seq;
+}
+// a session of the group, not given up on, that has not had the picture about to go
+static bool group_laggard(const HevcGroup *g, const DState *me, uint64_t seq);
+static int group_ring_find(const HevcGroup *g, uint64_t key)   // gGroupLock held
+{
+    for (int i = 0; i < GROUP_RING; i++) if (g->ring[i].key == key && key) return i;
+    return -1;
+}
+static void group_free(HevcGroup *g)   // no longer in the list, no lock held
+{
+    hevcdec_close(&g->dec); rm_close(&g->rm);
+    for (int i = 0; i < GROUP_RING; i++) if (g->ring[i].pb) CVPixelBufferRelease(g->ring[i].pb);
+    free(g);
+}
+static void group_leave(DState *s);
+// leave for another group, which already counts this session
+static void group_leave_keep(DState *s, HevcGroup *o) { group_leave(s); s->grp = o; s->hevc = &o->dec; }
+static void group_leave(DState *s)
+{
+    HevcGroup *g = s->grp; if (!g) return;
+    s->grp = NULL; s->hevc = NULL;
+    pthread_mutex_lock(&gGroupLock);
+    for (int i = 0; i < GROUP_MEMBERS; i++) if (g->member[i] == s) g->member[i] = NULL;
+    const bool last = --g->refs == 0;
+    pthread_cond_broadcast(&gGroupCv);
+    if (last) for (HevcGroup **q = &gGroups; *q; q = &(*q)->next) if (*q == g) { *q = g->next; break; }
+    pthread_mutex_unlock(&gGroupLock);
+    if (last) group_free(g);
+}
+// a decoder of its own for a session, fed the parameter sets of its format description; 0 = ok
+static int group_new(DState *s, uint64_t id, unsigned W, unsigned H, int depth, int cf, int topTid)
+{
+    HevcGroup *g = calloc(1, sizeof *g); if (!g) return -1;
+    if (rm_open(&g->rm) || rm_va_init(&g->rm) || hevcdec_open(&g->dec, &g->rm, W, H, depth, cf)) { rm_close(&g->rm); free(g); return -1; }
+    size_t count = 0;
+    CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(s->fmt, 0, NULL, NULL, &count, NULL);
+    for (size_t i = 0; i < count; i++) {
+        const uint8_t *ps; size_t n;
+        if (!CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(s->fmt, i, &ps, &n, NULL, NULL) && n) hevcdec_nal(&g->dec, ps, n);
+    }
+    g->id = id; g->refs = 1; g->born = nowms(); g->qosTop = topTid;
+    g->member[0] = s; s->seen = 0; s->stale = false;
+    pthread_mutex_lock(&gGroupLock); g->next = gGroups; gGroups = g; pthread_mutex_unlock(&gGroupLock);
+    s->grp = g; s->hevc = &g->dec;
+    return 0;
+}
+static bool group_laggard(const HevcGroup *g, const DState *me, uint64_t seq)
+{
+    for (int i = 0; i < GROUP_MEMBERS; i++) { const DState *m = g->member[i]; if (m && m != me && !m->stale && m->seen < seq) return true; }
+    return false;
+}
+
 // ---- base object ----
 static void out_drain(DState *s);
 static OSStatus b_invalidate(CMBaseObjectRef o)
@@ -185,7 +294,7 @@ static OSStatus b_invalidate(CMBaseObjectRef o)
     if (s->opened) {
         if (s->codec == CODEC_VP9) { park_vp9(s->vrm, s->vp9); s->vrm = NULL; s->vp9 = NULL; }
         else if (s->codec == CODEC_AV1) { park_av1(s->vrm, s->av1); s->vrm = NULL; s->av1 = NULL; }
-        else if (s->codec == kCMVideoCodecType_HEVC) { hevcdec_close(s->hevc); free(s->hevc); s->hevc = NULL; rm_close(&s->rm); }
+        else if (s->codec == kCMVideoCodecType_HEVC) group_leave(s);
         else if (is_mpeg12(s->codec)) { mpeg2dec_close(s->m2); free(s->m2); s->m2 = NULL; rm_close(&s->rm); }
         else if (s->codec == kCMVideoCodecType_MPEG4Video) { mpeg4dec_close(s->m4); free(s->m4); s->m4 = NULL; rm_close(&s->rm); }
         else { h264dec_close(&s->dec); rm_close(&s->rm); }
@@ -329,15 +438,18 @@ static OSStatus start_hevc(DState *s, VTVideoDecoderSession session, CMVideoForm
     const bool ok = cf >= 0 && (cf == 1 || cf == 3) && (depth == 8 || depth == 10) && cdepth == depth && W <= 8192 && H <= 8192;
     DLOG("startSession: HEVC %dx%d (coded %ux%u), %d-bit, chroma %d, %s range%s", cw, ch, W, H, depth, cf, full ? "full" : "video", ok ? "" : " - NOT SUPPORTED");
     if (!ok) return kVTVideoDecoderUnsupportedDataFormatErr;
-    s->w = cw; s->h = ch; s->qosTop = topTid; s->qosOff = getenv("NVDEC_NOQOS") != NULL;
-    if (!(s->hevc = calloc(1, sizeof *s->hevc)) || rm_open(&s->rm) || rm_va_init(&s->rm) || hevcdec_open(s->hevc, &s->rm, W, H, depth, cf)) {
-        DLOG("startSession: NVDEC session failed"); free(s->hevc); s->hevc = NULL; return kVTVideoDecoderMalfunctionErr;
-    }
-    s->opened = true;
-    for (size_t i = 0; i < count; i++) {                        // the decoder keeps its own parameter sets
+    s->w = cw; s->h = ch; s->qosOff = getenv("NVDEC_NOQOS") != NULL;
+    // the stream, as far as a shared decoder is concerned: its parameter sets and what the client asks for
+    uint64_t id = 0xCBF29CE484222325ull;
+    for (size_t i = 0; i < count; i++) {
         const uint8_t *ps; size_t n;
-        if (!CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(fmt, i, &ps, &n, NULL, NULL) && n) hevcdec_nal(s->hevc, ps, n);
+        if (!CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(fmt, i, &ps, &n, NULL, NULL) && n) id = hash_bytes(id, ps, n);
     }
+    CFDictionaryRef dstA = VTDecoderSessionGetDestinationPixelBufferAttributes(session);
+    if (dstA) { CFStringRef ds = CFCopyDescription(dstA); char b[1024] = ""; if (ds) { CFStringGetCString(ds, b, sizeof b, kCFStringEncodingUTF8); CFRelease(ds); } id = hash_bytes(id, (const uint8_t *)b, strlen(b)); }
+    s->W = W; s->H = H; s->depth = depth; s->cf = cf; s->topTid = topTid; s->streamId = id;
+    if (group_new(s, id, W, H, depth, cf, topTid)) { DLOG("startSession: NVDEC session failed"); return kVTVideoDecoderMalfunctionErr; }
+    s->opened = true;
     const OSType pf = cf == 3 ? (depth == 8 ? (full ? kCVPixelFormatType_444YpCbCr8BiPlanarFullRange : kCVPixelFormatType_444YpCbCr8BiPlanarVideoRange)
                                             : (full ? kCVPixelFormatType_444YpCbCr10BiPlanarFullRange : kCVPixelFormatType_444YpCbCr10BiPlanarVideoRange))
                               : (depth == 8 ? (full ? kCVPixelFormatType_420YpCbCr8BiPlanarFullRange : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
@@ -540,6 +652,7 @@ static OSStatus output_buffer(DState *s, unsigned w, unsigned h, CVPixelBufferRe
     return r;
 }
 
+static void out_drain_for_group(DState *s);
 // ---- output (T8.09) ----
 // A decoded picture is copied into its pixel buffer (untiled), emitted, and its surface released. Clients that allow
 // asynchronous decompression (kVTDecodeFrame_EnableAsynchronousDecompression: AVFoundation) get that from an output
@@ -606,6 +719,7 @@ static void *out_thread(void *arg)
 }
 
 static void out_drain(DState *s) { while (s->qh != s->qt) pthread_cond_wait(&s->cv, &s->lock); }   // lock held
+static void out_drain_for_group(DState *s) { out_drain(s); }
 
 // hand a frame's output over (lock held): queued in an asynchronous run, else done here
 static void out_deliver(DState *s, OutJob *j)
@@ -709,50 +823,160 @@ static OSStatus decode_av1(DState *s, VTVideoDecoderFrame frame, const uint8_t *
 enum { QOS_WINDOW_MS = 250, QOS_HOT_WINDOWS = 2, QOS_COOL_WINDOWS = 4, QOS_SETTLE_WINDOWS = 4 };
 static void qos_hevc(DState *s, VTDecodeFrameFlags flags, double now)
 {
-    if (!s->hevc) return;
-    if (!(flags & kVTDecodeFrame_1xRealTimePlayback)) { s->hevc->max_tid = HEVC_ALL_TIDS; s->hevc->copy_threads = 0; s->qosT0 = 0; return; }
-    if (!s->qosT0) { s->qosT0 = now; s->qosIn0 = s->tIn; }
-    else if (now - s->qosT0 >= QOS_WINDOW_MS) {
-        const double busy = (s->tIn - s->qosIn0) / (now - s->qosT0);
-        s->qosT0 = now; s->qosIn0 = s->tIn;
-        s->hevc->copy_threads = busy < 0.8 ? 1 : 0;
+    HevcGroup *g = s->grp; if (!g) return;
+    if (!(flags & kVTDecodeFrame_1xRealTimePlayback)) { if (g->refs == 1) { g->dec.max_tid = HEVC_ALL_TIDS; g->dec.copy_threads = 0; g->qosT0 = 0; } return; }
+    pthread_mutex_lock(&gGroupLock);
+    if (!g->qosT0) { g->qosT0 = now; g->qosBusy0 = g->tBusy; }
+    else if (now - g->qosT0 >= QOS_WINDOW_MS) {
+        const double busy = (g->tBusy - g->qosBusy0) / (now - g->qosT0);
+        g->qosT0 = now; g->qosBusy0 = g->tBusy;
+        g->dec.copy_threads = busy < 0.8 ? 1 : 0;
         if (busy > 0.9) {           // after a change the player is still catching up: it gets its time first
-            s->qosCool = 0;
-            if (++s->qosHot >= QOS_HOT_WINDOWS && s->qosLevel < s->qosTop && !s->qosOff) { s->qosLevel++; s->qosHot = -QOS_SETTLE_WINDOWS; DLOG("real time: decodeFrame busy %.0f %%, sub-layers up to %d", busy * 100, s->qosTop - s->qosLevel); }
+            g->qosCool = 0;
+            if (++g->qosHot >= QOS_HOT_WINDOWS && g->qosLevel < g->qosTop && !s->qosOff) { g->qosLevel++; g->qosHot = -QOS_SETTLE_WINDOWS; DLOG("real time: decoder busy %.0f %%, sub-layers up to %d", busy * 100, g->qosTop - g->qosLevel); }
         } else if (busy < 0.35) {   // twice the pictures would still fit
-            if (s->qosHot > 0) s->qosHot = 0;
-            if (++s->qosCool >= QOS_COOL_WINDOWS && s->qosLevel > 0) { s->qosLevel--; s->qosCool = 0; DLOG("real time: decodeFrame busy %.0f %%, sub-layers up to %d", busy * 100, s->qosTop - s->qosLevel); }
-        } else { if (s->qosHot > 0) s->qosHot = 0; s->qosCool = 0; }
+            if (g->qosHot > 0) g->qosHot = 0;
+            if (++g->qosCool >= QOS_COOL_WINDOWS && g->qosLevel > 0) { g->qosLevel--; g->qosCool = 0; DLOG("real time: decoder busy %.0f %%, sub-layers up to %d", busy * 100, g->qosTop - g->qosLevel); }
+        } else { if (g->qosHot > 0) g->qosHot = 0; g->qosCool = 0; }
     }
-    s->hevc->max_tid = s->qosLevel ? s->qosTop - s->qosLevel : HEVC_ALL_TIDS;
+    g->dec.max_tid = g->qosLevel ? g->qosTop - g->qosLevel : HEVC_ALL_TIDS;
+    pthread_mutex_unlock(&gGroupLock);
 }
 
 // HEVC: one sample is one access unit (one picture), emitted in decode order like H.264's. A picture not to be output
 // (pic_output_flag 0, or a RASL picture after the CRA decoding started at, which is skipped) is reported dropped.
-static OSStatus decode_hevc(DState *s, VTVideoDecoderFrame frame, const uint8_t *p, size_t len)
+static OSStatus decode_hevc_picture(DState *s, const uint8_t *p, size_t len, OutJob *j)   // fills the job: its picture still to be copied
 {
     HevcDec *d = s->hevc; int r = 0; OSStatus res = noErr;
     size_t pos = 0; const uint8_t *nal; size_t n;
     while (r >= 0 && hevc_next_lenpfx(p, len, s->nalLen, &pos, &nal, &n)) { int q = hevcdec_nal(d, nal, n); if (q) r = q; }
     if (r >= 0) { int q = hevcdec_flush(d); if (q) r = q; }
     if (r < 0) res = kVTVideoDecoderBadDataErr;
-    OutJob j = { .frame = frame, .surf = -1, .rel = -1 }; bool out = false;
+    bool out = false;
     if (!res && r == 1) {
         s->tEngine += d->engine_ms;
-        out = d->cur_output; j.rel = d->cur_surf;
+        out = d->cur_output; j->rel = d->cur_surf;
         if (out) {
-            j.w = (unsigned)d->cur_w; j.h = (unsigned)d->cur_h; j.cx = (unsigned)d->cur_crop[0]; j.cy = (unsigned)d->cur_crop[2];
+            j->w = (unsigned)d->cur_w; j->h = (unsigned)d->cur_h; j->cx = (unsigned)d->cur_crop[0]; j->cy = (unsigned)d->cur_crop[2];
             const double tp = nowms();
-            if (output_buffer(s, j.w, j.h, &j.pb) || !j.pb) res = kVTVideoDecoderMalfunctionErr; else j.surf = d->cur_surf;
+            if (output_buffer(s, j->w, j->h, &j->pb) || !j->pb) res = kVTVideoDecoderMalfunctionErr; else j->surf = d->cur_surf;
             s->tPool += nowms() - tp;
         }
         s->frames++;
     }
-    if (gDLog && (s->frames <= 3 || res)) DLOG("decodeFrame %p: %zu bytes -> %d, picture %d (POC %d%s), status 0x%x, %.2f ms", frame, len, (int)res, r,
+    if (gDLog && (s->frames <= 3 || res)) DLOG("decodeFrame: %zu bytes -> %d, picture %d (POC %d%s), status 0x%x, %.2f ms", len, (int)res, r,
                                               d->cur_poc, out ? "" : ", not output", d->err_status, d->engine_ms);
-    j.res = res; j.fl = (!res && !out) ? kVTDecodeInfo_FrameDropped : 0;
-    out_deliver(s, &j);
+    j->res = res; j->fl = (!res && !out) ? kVTDecodeInfo_FrameDropped : 0;
     return res;
+}
+
+// The sample's first picture NAL unit: 16 to 23 are IRAP, 19 and 20 IDR; -1 none
+static int hevc_first_vcl(DState *s, const uint8_t *p, size_t len)
+{
+    size_t pos = 0; const uint8_t *nal; size_t n;
+    while (hevc_next_lenpfx(p, len, s->nalLen, &pos, &nal, &n)) { if (n >= 2 && ((nal[0] >> 1) & 63) < 32) return (nal[0] >> 1) & 63; }
+    return -1;
+}
+
+static OSStatus decode_hevc(DState *s, VTVideoDecoderFrame frame, const uint8_t *p, size_t len)
+{
+    OutJob j = { .frame = frame, .surf = -1, .rel = -1 };
+    const double t0 = nowms();
+    HevcGroup *g = s->grp;
+    if (!share_here()) {   // one decoder per session
+        const OSStatus res = decode_hevc_picture(s, p, len, &j);
+        out_deliver(s, &j);
+        g->tBusy += nowms() - t0;   // the caller holds the session's lock; nobody else uses this group
+        return res;
+    }
+    const int t = hevc_first_vcl(s, p, len);
+    const bool idr = t == 19 || t == 20, irap = t >= 16 && t <= 23;
+    if (s->waitIrap && !irap) { j.fl = kVTDecodeInfo_FrameDropped; out_deliver(s, &j); return noErr; }   // out of step: nothing to decode from yet
+    const uint64_t before = s->chain;
+    const uint64_t key = hash_bytes(idr || !s->chainStarted || s->waitIrap ? s->streamId : s->chain, p, len);
+    s->chain = key; s->chainStarted = true; bool fresh = idr || s->waitIrap; s->waitIrap = false;   // fresh: nothing needed from before
+
+again:
+    pthread_mutex_lock(&gGroupLock);
+    // A session starting, or at an IDR, may join a group that has or is making this very picture
+    if (fresh || before == 0) {
+        for (HevcGroup *o = gGroups; o; o = o->next) {
+            int free = -1; for (int i = GROUP_MEMBERS - 1; i >= 0; i--) if (!o->member[i]) free = i;
+            if (o != g && free >= 0 && o->id == s->streamId && group_open(o, t0) && ((o->decoding && o->decodingKey == key) || group_ring_find(o, key) >= 0)) {
+                o->refs++; o->member[free] = s; s->seen = o->seq > GROUP_PICS ? o->seq - GROUP_PICS : 0; s->stale = false;
+                pthread_mutex_unlock(&gGroupLock);
+                out_drain_for_group(s);   // pictures on their way out may still be copied from the decoder it leaves
+                group_leave_keep(s, o); g = o;
+                DLOG("session joins the decoder of another (%u sessions)", o->refs);
+                pthread_mutex_lock(&gGroupLock);
+                break;
+            }
+        }
+    }
+    const double deadline = t0 + GROUP_WAIT_MS;
+    const bool lone = !group_open(g, t0);
+    for (;;) {
+        const int hit = group_ring_find(g, key);
+        if (hit >= 0) {
+            j.res = g->ring[hit].res; j.fl = g->ring[hit].fl; j.pb = g->ring[hit].pb ? CVPixelBufferRetain(g->ring[hit].pb) : NULL;
+            if (g->ring[hit].seq > s->seen) s->seen = g->ring[hit].seq;
+            s->stale = false;
+            pthread_cond_broadcast(&gGroupCv);
+            pthread_mutex_unlock(&gGroupLock);
+            if (j.pb) s->frames++;
+            const OSStatus res = j.res;
+            out_deliver(s, &j);
+            return res;
+        }
+        if (g->decoding) {   // being decoded by another session, or something before it
+            struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); ts.tv_sec += 4;
+            if (pthread_cond_timedwait(&gGroupCv, &gGroupLock, &ts)) break;
+            continue;
+        }
+        if (!fresh && g->head != before) break;   // out of step
+        if (lone) {   // alone from now on: as with one decoder per session
+            g->head = key;
+            for (int i = 0; i < GROUP_RING; i++) if (g->ring[i].pb) { CVPixelBufferRelease(g->ring[i].pb); g->ring[i].pb = NULL; g->ring[i].key = 0; }
+            pthread_mutex_unlock(&gGroupLock);
+            const OSStatus res = decode_hevc_picture(s, p, len, &j);
+            out_deliver(s, &j);
+            g->tBusy += nowms() - t0;
+            return res;
+        }
+        // a moment for a session about to lose a picture it has not had, then it is on its own
+        const int full = group_ring_full(g);
+        if (full >= 0 && group_laggard(g, s, g->ring[full].seq)) {
+            if (nowms() < deadline) {
+                struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); ts.tv_nsec += 5000000; if (ts.tv_nsec >= 1000000000) { ts.tv_sec++; ts.tv_nsec -= 1000000000; }
+                pthread_cond_timedwait(&gGroupCv, &gGroupLock, &ts);
+                continue;
+            }
+            for (int i = 0; i < GROUP_MEMBERS; i++) { DState *m = g->member[i]; if (m && m != s && m->seen < g->ring[full].seq) m->stale = true; }
+        }
+        g->decoding = true; g->decodingKey = key;
+        pthread_mutex_unlock(&gGroupLock);
+        const double tWork = nowms();   // what counts as busy: not the wait for the others
+        OSStatus res = decode_hevc_picture(s, p, len, &j);
+        if (j.pb && j.surf >= 0 && !res) { out_copy(s, &j); s->tCopy += j.usCopy / 1000.0; }   // whole before anyone else gets it
+        if (j.rel >= 0) { hevcdec_release(s->hevc, j.rel); j.rel = -1; }
+        j.surf = -1;
+        pthread_mutex_lock(&gGroupLock);
+        s->seen = group_ring_put(g, key, j.pb, j.res, j.fl);
+        g->head = key; g->decoding = false; g->tBusy += nowms() - tWork;
+        pthread_cond_broadcast(&gGroupCv);
+        pthread_mutex_unlock(&gGroupLock);
+        out_deliver(s, &j);
+        return res;
+    }
+    pthread_mutex_unlock(&gGroupLock);
+    // Out of step: fell behind what is kept, or went elsewhere. A decoder of its own, from this picture if it can start one
+    DLOG("session out of step after %u pictures, a decoder of its own%s", s->frames, irap ? "" : " at the next IRAP");
+    out_drain_for_group(s);
+    group_leave(s);
+    if (group_new(s, s->streamId, s->W, s->H, s->depth, s->cf, s->topTid)) { j.res = kVTVideoDecoderMalfunctionErr; out_deliver(s, &j); return kVTVideoDecoderMalfunctionErr; }
+    if (!irap) { s->waitIrap = true; j.fl = kVTDecodeInfo_FrameDropped; out_deliver(s, &j); return noErr; }
+    g = s->grp; fresh = true;
+    goto again;
 }
 
 // MPEG-1/2: one sample is one coded frame (a frame picture or both fields), emitted in decode order like H.264's; a B
