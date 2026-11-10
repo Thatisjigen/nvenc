@@ -1105,6 +1105,24 @@ __attribute__((visibility("default"))) OSStatus NVEncVT_Register(int rating)
     return first = st;
 }
 
+// The decoders alone, for a process that plays video and never encodes: NullMoth's plugin calls this in the system's
+// decode service and in WebKit's GPU process. Same GPU check as NVEncVT_Register; the decoders register once per
+// process, whichever of the two entries comes first. Returns the H.264 decoder's status (the others are in the log).
+__attribute__((visibility("default"))) OSStatus NVEncVT_RegisterDecoders(int rating)
+{
+    extern OSStatus NVDecVT_Register(int rating);
+    if (gNvencvtGpu <= 0) {
+        int gpu = getenv("NVENCVT_ANY_GPU") ? GPU_ADA : pci_gpu_kind();
+        if (gpu < 0) gpu = gpu_nvenc_kind();
+        if (gpu <= 0) {
+            LOG("GPU is neither Ada, TU117, GA10x nor GB20x (NVENC class c9b7 / b4b7 / c7b7, PCI 2b00-2fff): no decoders to register");
+            return kVTCouldNotFindVideoDecoderErr;
+        }
+        gNvencvtGpu = gpu;
+    }
+    return NVDecVT_Register(rating);
+}
+
 // installed in the plugin bundle in place of NullMoth's own decoder libraries (libnvdec_h264.dylib,
 // libnvdec_hevc.dylib), this library answers for them. NullMoth's plugin opens those in every process that gets a Metal device
 // on the card and, for Apple's sandboxed apps (QuickTime, Photos, Quick Look), in VTDecoderXPCService, and registers their

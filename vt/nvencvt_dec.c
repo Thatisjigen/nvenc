@@ -1191,7 +1191,7 @@ static NvU32 nvdec_class(void)
 // (0xc9b0) and Turing's (0xc4b0) and were not tried on 0xc7b0, and a decoder that registers and then fails is worse than
 // none (VideoToolbox does not fall back to another decoder once it picked ours). NVENCVT_AMPERE_ALL_DEC=1 registers
 // them all anyway.
-OSStatus NVDecVT_Register(int rating)
+static OSStatus register_decoders(int rating)
 {
     gDLog = getenv("NVENCVT_LOG") != NULL;
     if (!gDLog && access("/tmp/nvencvt.log", F_OK) == 0) { char p[64]; snprintf(p, sizeof p, "/tmp/nvencvt-%d.log", (int)getpid()); if ((gDLogF = fopen(p, "a"))) gDLog = true; }
@@ -1270,4 +1270,12 @@ OSStatus NVDecVT_Register(int rating)
     }
     CFRelease(nr);
     return st;
+}
+
+// Once per process: NVEncVT_Register and NVEncVT_RegisterDecoders both end here, and a plugin may call both.
+OSStatus NVDecVT_Register(int rating)
+{
+    static int done; static OSStatus first;
+    if (!done++) first = register_decoders(rating);
+    return first;
 }

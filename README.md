@@ -49,8 +49,10 @@ DYLD_INSERT_LIBRARIES=/Library/GPUBundles/NVMTLDriver.bundle/Contents/MacOS/libn
   `libnvencvt.dylib` into every process that uses Metal when `NVMTL_NVENCVT=1` is in `nvrm610.conf` (its own hook since
   driver 2.3.7; the library must be root-owned). VideoToolbox then lists "NVENC - H.264 - (NVIDIA <card>) - mickys/nvenc -
   <version>", its HEVC and AV1 twins, and our decoders, rated above Apple's and NullMoth's. Safari is the exception: its GPU
-  process cannot load the plugin, so its video plays on Apple's software decoders (no third-party route;
-  [docs/benchmarks.md](docs/benchmarks.md) "Decode").
+  process (`com.apple.WebKit.GPU`) may not map code from `/Library/GPUBundles`, so its video plays on Apple's software
+  decoders ([docs/benchmarks.md](docs/benchmarks.md) "Decode") unless a kernel extension grants that mapping for the
+  plugin and this library. Where it is granted, NullMoth's plugin (2.9) registers the decoders in that process through
+  `NVEncVT_RegisterDecoders` when `NVMTL_NVENCVT` names it.
 - **Command-line tools** (ffmpeg, HandBrakeCLI, avconvert) never use Metal, so they get the codecs only through the
   overlay's wrapper: `nvenc-run ffmpeg -i in.mov -c:v hevc_videotoolbox -b:v 20M out.mp4` (it sets `DYLD_INSERT_LIBRARIES`
   for that one tool; the library registers itself when injected). macOS has no supported way for a third party to
