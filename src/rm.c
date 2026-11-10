@@ -1,11 +1,13 @@
 // rm.c: see rm.h.
 #include "rm.h"
 #include "blocklinear.h"
+#include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/stat.h>
 #include "nv_escape.h"
 #include "class/cl0005.h"
 #include "class/cl0000.h"
@@ -21,6 +23,37 @@
 
 enum { SEL_ESC = 1, SEL_BINDFD = 3, SEL_EVWAIT = 6 };
 
+// A descriptor of our own for each connection: only its number is used, it is never read. Normally the null device.
+// A sandbox can refuse a fresh open of it; then the read end of an empty pipe does. WebKit's GPU process refuses
+// pipe() as well: what it leaves is a duplicate of the null device the process already has as standard input, checked
+// against /dev/null once we own it. Anything else on stdin is not used. The way that worked is kept, so the sandbox
+// is asked (and logs its refusal) once, not for every connection.
+static int fd_token(void)
+{
+    static int way;   // 0 open, 1 pipe, 2 stdin
+    if (way == 0) {
+        int fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+        if (fd >= 0 || (errno != EACCES && errno != EPERM)) return fd;
+        way = 1;
+    }
+    if (way == 1) {
+        int p[2];
+        if (pipe(p) == 0) { close(p[1]); fcntl(p[0], F_SETFD, FD_CLOEXEC); return p[0]; }   // the read end of a pipe nobody writes
+        if (errno != EACCES && errno != EPERM) return -1;
+        way = 2;
+    }
+    struct stat null, st;
+    if (lstat("/dev/null", &null) || !S_ISCHR(null.st_mode)) return -1;
+    int fd = dup(STDIN_FILENO);
+    if (fd < 0) return -1;
+    const int fl = fcntl(fd, F_GETFL);
+    if (fl < 0 || (fl & O_ACCMODE) != O_RDONLY || fstat(fd, &st) || !S_ISCHR(st.st_mode) || st.st_rdev != null.st_rdev) {
+        close(fd); errno = EBADF; return -1;
+    }
+    fcntl(fd, F_SETFD, FD_CLOEXEC);
+    return fd;
+}
+
 static io_connect_t open_conn_fd(NvU32 type, int *fdOut)
 {
     // NVAccel's bridge first (0x4E56xxxx), then NVRM itself, as NVK's nvrm_xnu_open does
@@ -33,7 +66,8 @@ static io_connect_t open_conn_fd(NvU32 type, int *fdOut)
         kr = IOServiceOpen(svc, mach_task_self(), type, &conn); IOObjectRelease(svc);
         if (kr != KERN_SUCCESS) return 0;
     }
-    int fd = open("/dev/null", O_RDONLY | O_CLOEXEC);   // the user client keys its RM file on an fd number
+    int fd = fd_token();   // the user client keys its RM file on an fd number
+    if (fd < 0) { fprintf(stderr, "rm: no descriptor to key the connection on (errno %d)\n", errno); IOServiceClose(conn); return 0; }
     uint64_t in = (uint64_t)fd;
     IOConnectCallScalarMethod(conn, SEL_BINDFD, &in, 1, NULL, NULL);
     if (fdOut) *fdOut = fd;
