@@ -1243,7 +1243,14 @@ static OSStatus register_decoders(int rating)
     const NvU32 nvcls = gNvencvtGpu == 1 ? 0xc9b0 : gNvencvtGpu == 2 ? 0xc4b0 : gNvencvtGpu == 4 ? 0xcfb0 : nvdec_class();   // 4: GB20x
     const bool hasAv1 = nvcls == 0xc7b0 || nvcls == 0xc9b0 || nvcls == 0xcfb0;   // 0xcfb0: Blackwell, 8-bit only
     DLOG("NVDEC class 0x%x%s", nvcls, hasAv1 ? " (AV1)" : " (no AV1)");
-    if (!getenv("NVENCVT_NO_AV1DEC") && hasAv1) {   // AV1 likewise (NVENCVT_NO_AV1DEC=1 leaves it out)
+    // GB20x decodes 8-bit AV1 only (av1dec.c refuses 10-bit there). VideoToolbox answers a client that asks what an AV1
+    // decoder can do with one fixed list for any registered hardware decoder, 8 and 10-bit alike; WebKit goes by that
+    // list and has no other AV1 decoder, so a page that then picks 10-bit AV1 gets "Media failed to decode". No AV1 in
+    // WebKit's GPU process on this GPU, then: its pages keep VP9, which decodes at both depths
+    // (NVENCVT_AV1DEC_WEBKIT=1 registers it there anyway).
+    const bool webkitNoAv1 = blackwell && !strcmp(getprogname(), "com.apple.WebKit.GPU") && !getenv("NVENCVT_AV1DEC_WEBKIT");
+    if (webkitNoAv1 && hasAv1) DLOG("GB20x: no AV1 decoder in WebKit's GPU process (10-bit AV1 is refused on this GPU and WebKit cannot be told)");
+    if (!getenv("NVENCVT_NO_AV1DEC") && hasAv1 && !webkitNoAv1) {   // AV1 likewise (NVENCVT_NO_AV1DEC=1 leaves it out)
         const void *va[] = { CFSTR(DECODER_ID_AV1), CFSTR("NVDEC - AV1 - mickys/nvenc"), nr, kCFBooleanTrue };
         CFDictionaryRef ia = CFDictionaryCreate(NULL, k, va, 4, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
         OSStatus sa = reg(CODEC_AV1, ia, (void *)NVDecVT_CreateInstance);
