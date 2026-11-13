@@ -11,6 +11,7 @@
 #include "hevcdec.h"
 #include "mpeg2dec.h"
 #include "mpeg4dec.h"
+#include "gpuntile.h"
 #include <CoreFoundation/CoreFoundation.h>
 #include <CoreMedia/CoreMedia.h>
 #include <CoreVideo/CoreVideo.h>
@@ -658,11 +659,75 @@ static void out_drain_for_group(DState *s);
 // asynchronous decompression (kVTDecodeFrame_EnableAsynchronousDecompression: AVFoundation) get that from an output
 // thread while the engine decodes the next picture; synchronous ones (ffmpeg) inside decodeFrame. Every frame of an
 // asynchronous run goes through the queue (errors and dropped frames too), so they come out in decode order.
+extern int nvdec_gob_blackwell;   // blocklinear.c: H.264 on NVDEC 0xcfb0 writes the Blackwell GOBs, else the nvenc_in layout
+
+// Fill the integrated-GPU untile jobs (luma = g[0], chroma = g[1]) for the current surface, mirroring EXACTLY the plane
+// parameters each decoder's read_nv12 passes to nvenc_in_untile_plane / nvdec_untile_plane (widths in bytes). Returns 1
+// when the surface can be untiled on the GPU, or 0 for the cropped-left/top case (rare), which stays on the CPU path.
+static int out_plane_jobs(DState *s, const OutJob *j, GpuPlaneJob g[2])
+{
+    const unsigned w = j->w, h = j->h; const int surf = j->surf;
+    if (s->codec == CODEC_VP9) {
+        Vp9Dec *d = s->vp9; const uint32_t b = (uint32_t)d->bps;
+        g[0] = (GpuPlaneJob){ .src = &d->luma[surf],   .width = w * b,              .rows = h,           .pitch = (uint32_t)d->pitch, .mode = GPU_UNTILE_NVENC_IN, .bpp = b };
+        g[1] = (GpuPlaneJob){ .src = &d->chroma[surf], .width = ((w + 1) & ~1u) * b, .rows = (h + 1) / 2, .pitch = (uint32_t)d->pitch, .mode = GPU_UNTILE_NVENC_IN, .bpp = b };
+        return 1;
+    }
+    if (s->codec == CODEC_AV1) {
+        Av1Dec *d = s->av1; const uint32_t b = (uint32_t)d->bps;
+        g[0] = (GpuPlaneJob){ .src = &d->luma[surf],   .width = w * b,              .rows = h,           .pitch = (uint32_t)d->pitch, .mode = GPU_UNTILE_NVENC_IN, .bpp = b };
+        g[1] = (GpuPlaneJob){ .src = &d->chroma[surf], .width = ((w + 1) & ~1u) * b, .rows = (h + 1) / 2, .pitch = (uint32_t)d->pitch, .mode = GPU_UNTILE_NVENC_IN, .bpp = b };
+        return 1;
+    }
+    if (s->codec == kCMVideoCodecType_HEVC) {
+        HevcDec *d = s->hevc; if (j->cx || j->cy) return 0;
+        const uint32_t b = (uint32_t)d->bps, cp = d->chroma_format == 3 ? 2 * (uint32_t)d->pitch : (uint32_t)d->pitch;
+        const uint32_t cw = d->chroma_format == 3 ? w : (w + 1) / 2, ch = d->chroma_format == 3 ? h : (h + 1) / 2;
+        g[0] = (GpuPlaneJob){ .src = &d->luma[surf],   .width = w * b,       .rows = h,  .pitch = (uint32_t)d->pitch, .mode = GPU_UNTILE_NVENC_IN, .bpp = b };
+        g[1] = (GpuPlaneJob){ .src = &d->chroma[surf], .width = 2 * cw * b,  .rows = ch, .pitch = cp,                 .mode = GPU_UNTILE_NVENC_IN, .bpp = b };
+        return 1;
+    }
+    if (is_mpeg12(s->codec)) {
+        Mpeg2Dec *d = s->m2;
+        g[0] = (GpuPlaneJob){ .src = &d->luma[surf],   .width = w, .rows = h,           .pitch = (uint32_t)d->pitch, .mode = GPU_UNTILE_NVENC_IN, .bpp = 1 };
+        g[1] = (GpuPlaneJob){ .src = &d->chroma[surf], .width = w, .rows = (h + 1) / 2, .pitch = (uint32_t)d->pitch, .mode = GPU_UNTILE_NVENC_IN, .bpp = 1 };
+        return 1;
+    }
+    if (s->codec == kCMVideoCodecType_MPEG4Video) {
+        Mpeg4Dec *d = s->m4;
+        g[0] = (GpuPlaneJob){ .src = &d->luma[surf],   .width = w, .rows = h,           .pitch = (uint32_t)d->pitch, .mode = GPU_UNTILE_NVENC_IN, .bpp = 1 };
+        g[1] = (GpuPlaneJob){ .src = &d->chroma[surf], .width = w, .rows = (h + 1) / 2, .pitch = (uint32_t)d->pitch, .mode = GPU_UNTILE_NVENC_IN, .bpp = 1 };
+        return 1;
+    }
+    H264Dec *d = &s->dec; if (d->x0[surf] || d->y0[surf]) return 0;   // H.264 (nvdec layout: Blackwell GOBs on 0xcfb0)
+    const uint32_t mode = nvdec_gob_blackwell ? GPU_UNTILE_NVDEC_BLACKWELL : GPU_UNTILE_NVENC_IN;
+    g[0] = (GpuPlaneJob){ .src = &d->luma[surf],   .width = w, .rows = h,     .pitch = (uint32_t)d->pitch, .mode = mode, .bpp = 1 };
+    g[1] = (GpuPlaneJob){ .src = &d->chroma[surf], .width = w, .rows = h / 2, .pitch = (uint32_t)d->pitch, .mode = mode, .bpp = 2 };
+    return 1;
+}
+
 static void out_copy(DState *s, OutJob *j)
 {
     if (!j->pb || j->surf < 0 || j->res) return;
     const double tc = nowms();
     CVPixelBufferRef pb = j->pb;
+    // Untile straight into the output IOSurface on the integrated GPU (no CPU untile, no CPU copy) when it is ready and the
+    // surface is not cropped on the left/top; otherwise fall through to the CPU untile below (identical result).
+    IOSurfaceRef ios;
+    GpuPlaneJob g[2];
+    if (gpu_untile_ready() && (ios = CVPixelBufferGetIOSurface(pb)) && out_plane_jobs(s, j, g)) {
+        // Lock the pixel buffer around the GPU untile, exactly as the CPU path below does: it brings the IOSurface into
+        // the shared linear state the GPU writes and bumps its seed on unlock, so a consumer on a different GPU (the one
+        // that drives the display) sees the new frame instead of a stale surface (green). Decline -> CPU untile.
+        CVPixelBufferLockBaseAddress(pb, 0);
+        int grc = gpu_untile_nv12((void *)ios, &g[0], &g[1]);
+        CVPixelBufferUnlockBaseAddress(pb, 0);
+        if (grc == 0) {
+            if (s->colour && !getenv("NVDEC_NOCOLOUR")) CVBufferSetAttachments(pb, s->colour, kCVAttachmentMode_ShouldPropagate);
+            j->usCopy = (unsigned)((nowms() - tc) * 1000);
+            return;
+        }
+    }
     CVPixelBufferLockBaseAddress(pb, 0);
     uint8_t *y = CVPixelBufferGetBaseAddressOfPlane(pb, 0), *uv = CVPixelBufferGetBaseAddressOfPlane(pb, 1);
     const size_t ys = CVPixelBufferGetBytesPerRowOfPlane(pb, 0), uvs = CVPixelBufferGetBytesPerRowOfPlane(pb, 1);
