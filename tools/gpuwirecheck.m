@@ -87,17 +87,30 @@ static int run(const char *name, int codec, OSType pf, unsigned w, unsigned h, i
     g[0] = (GpuPlaneJob){ .src = &mL, .width = luma_wb,  .rows = h,     .pitch = pitch, .mode = lumaMode,   .bpp = lumaBpp };
     g[1] = (GpuPlaneJob){ .src = &mC, .width = chroma_wb, .rows = crows, .pitch = cp,    .mode = chromaMode, .bpp = chromaBpp };
     if (!gpu_untile_ready()) { printf("  %-22s SKIP (no integrated GPU)\n", name); CVPixelBufferUnlockBaseAddress(pb, 0); CVPixelBufferRelease(pb); free(refY); free(refUV); free(tL); free(tC); return 0; }
-    int rc = gpu_untile_nv12((void *)CVPixelBufferGetIOSurface(pb), &g[0], &g[1]);
+    IOSurfaceRef ios = CVPixelBufferGetIOSurface(pb);
+    int rc = gpu_untile_nv12((void *)ios, &g[0], &g[1]);
 
     const uint8_t *gotY = CVPixelBufferGetBaseAddressOfPlane(pb, 0), *gotUV = CVPixelBufferGetBaseAddressOfPlane(pb, 1);
     size_t fr, fx, dY = cmp_plane(refY, gotY, ys, luma_wb, h, &fr, &fx);
     size_t gr, gx, dC = cmp_plane(refUV, gotUV, uvs, chroma_wb, crows, &gr, &gx);
-    int fail = rc != 0 || dY || dC;
-    printf("  %-22s %s  luma %ux%uB %s  chroma %ux%uB %s%s\n", name, fail ? "FAIL" : "PASS",
-           luma_wb, h, dY ? "MISMATCH" : "ok", chroma_wb, crows, dC ? "MISMATCH" : "ok", rc ? "  (gpu_untile_nv12 returned nonzero)" : "");
-    if (dY) printf("      luma   first diff row %zu x %zu: ref=%02x gpu=%02x (%zu bytes)\n", fr, fx, refY[fr*ys+fx], gotY[fr*ys+fx], dY);
-    if (dC) printf("      chroma first diff row %zu x %zu: ref=%02x gpu=%02x (%zu bytes)\n", gr, gx, refUV[gr*uvs+gx], gotUV[gr*uvs+gx], dC);
 
+    // second pass into the same, cleared surface: exercises the cached wrappers (hit path); must be bit-exact too
+    memset((void *)gotY, 0, ys * (size_t)h); memset((void *)gotUV, 0, uvs * (size_t)crows);
+    int rc2 = gpu_untile_nv12((void *)ios, &g[0], &g[1]);
+    size_t fr2, fx2, dY2 = cmp_plane(refY, gotY, ys, luma_wb, h, &fr2, &fx2);
+    size_t gr2, gx2, dC2 = cmp_plane(refUV, gotUV, uvs, chroma_wb, crows, &gr2, &gx2);
+
+    int fail = rc != 0 || rc2 != 0 || dY || dC || dY2 || dC2;
+    printf("  %-22s %s  luma %ux%uB %s  chroma %ux%uB %s  cache %s%s\n", name, fail ? "FAIL" : "PASS",
+           luma_wb, h, dY ? "MISMATCH" : "ok", chroma_wb, crows, dC ? "MISMATCH" : "ok",
+           (dY2 || dC2) ? "MISMATCH" : "ok", (rc || rc2) ? "  (gpu_untile_nv12 returned nonzero)" : "");
+    if (dY)  printf("      luma   first diff row %zu x %zu: ref=%02x gpu=%02x (%zu bytes)\n", fr, fx, refY[fr*ys+fx], gotY[fr*ys+fx], dY);
+    if (dC)  printf("      chroma first diff row %zu x %zu: ref=%02x gpu=%02x (%zu bytes)\n", gr, gx, refUV[gr*uvs+gx], gotUV[gr*uvs+gx], dC);
+    if (dY2 || dC2) printf("      cache  pass differs from the first pass (%zu luma, %zu chroma bytes)\n", dY2, dC2);
+
+    // the decoder drops a surface's wrapper (via rm_mem_free -> gpu_untile_forget_src) before freeing it; do the same,
+    // so the next profile reusing this address can't hit a stale wrapper and the invalidation path gets exercised.
+    gpu_untile_forget_src(tL); gpu_untile_forget_src(tC);
     CVPixelBufferUnlockBaseAddress(pb, 0); CVPixelBufferRelease(pb); free(refY); free(refUV); free(tL); free(tC);
     return fail;
 }
@@ -117,6 +130,7 @@ int main(int argc, char **argv)
     f += run("hevc nv24 4:4:4",     C_HEVC, NV24, W, H, 1, 3, 0);
     f += run("vp9 p010 10-bit",     C_VP9,  P010, W, H, 2, 1, 0);
     f += run("mpeg2 nv12",          C_MPEG2,NV12, W, H, 1, 1, 0);
+    gpu_untile_flush();
     printf("\nRESULT: %s (%d profile%s failed)\n", f ? "WIRING BIT-EXACT FAILURES" : "all profiles bit-exact", f, f == 1 ? "" : "s");
     return f ? 1 : 0;
 }
