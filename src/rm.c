@@ -221,8 +221,12 @@ NV_STATUS rm_mem_alloc(Rm *rm, RmMem *m, NvU64 size, NvU64 align, bool sysmem, b
     return NV_OK;
 }
 
+static void (*g_mem_free_hook)(const void *);
+void rm_set_mem_free_hook(void (*fn)(const void *)) { g_mem_free_hook = fn; }
+
 void rm_mem_free(Rm *rm, RmMem *m)
 {
+    if (g_mem_free_hook && m->cpu) g_mem_free_hook(m->cpu);   // let an observer drop a cached mapping first
     if (m->map.conn) rm_unmap_cpu(rm, &m->map);
     if (m->hVirt) rm_free(rm, rm->device, m->hVirt);
     if (m->hPhys) rm_free(rm, rm->device, m->hPhys);

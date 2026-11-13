@@ -30,6 +30,16 @@ int gpu_untile_ready(void);
 // buffer on the integrated GPU. Returns 0 on success, non-zero to fall back to the CPU untile.
 int gpu_untile_nv12(void *iosurface, const GpuPlaneJob *luma, const GpuPlaneJob *chroma);
 
+// Drop any cached wrapper over the source mapping at `cpu`. rm_mem_free calls this (as the registered hook) before it
+// unmaps a decoder surface, so a wrapper is never kept over freed pages. No-op when nothing is cached for `cpu`.
+void gpu_untile_forget_src(const void *cpu);
+
+// Release every cached wrapper (and the IOSurfaces retained for the destination wrappers). For shutdown and tests.
+void gpu_untile_flush(void);
+
+// GPU execution time of the last gpu_untile_nv12 command buffer, in milliseconds (diagnostic for the microbench).
+double gpu_untile_last_gpu_ms(void);
+
 #ifdef __cplusplus
 }
 #endif
