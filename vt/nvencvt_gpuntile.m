@@ -15,7 +15,10 @@
 #include <stdlib.h>
 #include <unistd.h>
 
-// byte-wise, one copy run per thread; run = 16 (nvenc_in / Blackwell 16-bit) or 8 (Blackwell 8-bit).
+// One thread per copy run: `run` contiguous destination bytes fed from `run` contiguous source bytes, whose block-linear
+// offset is computed from the run's first byte. run = 16 (nvenc_in, and the Blackwell 16-bit GOB) or 8 (Blackwell 8-bit).
+// A whole, aligned run is copied with one vector load/store (uint4 = 16 B, uint2 = 8 B); a row tail (partial run) or an
+// unaligned surface falls back to the byte copy. Same bytes on either path, so the result is bit-exact.
 static NSString *KERNEL_SRC =
 @"#include <metal_stdlib>\n"
 @"using namespace metal;\n"
@@ -26,6 +29,8 @@ static NSString *KERNEL_SRC =
 @"  uint x=gid.x*p.run, y=gid.y; if(x>=p.width||y>=p.rows) return;\n"
 @"  uint off=(p.mode==0)?off_nvenc_in(x,y,p.pitch):off_nvdec_bw(x,y,p.pitch,p.bpp);\n"
 @"  uint n=min(p.run,p.width-x), db=p.dst_offset+y*p.dst_stride+x;\n"
+@"  if(n==16 && ((off|db)&15u)==0){ *(device uint4*)(dst+db)=*(device const uint4*)(src+off); return; }\n"
+@"  if(n==8 && ((off|db)&7u)==0){ *(device uint2*)(dst+db)=*(device const uint2*)(src+off); return; }\n"
 @"  for(uint i=0;i<n;i++) dst[db+i]=src[off+i];\n"
 @"}\n";
 
