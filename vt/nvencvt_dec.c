@@ -1289,11 +1289,33 @@ static NvU32 nvdec_class(void)
 // (0xc9b0) and Turing's (0xc4b0) and were not tried on 0xc7b0, and a decoder that registers and then fails is worse than
 // none (VideoToolbox does not fall back to another decoder once it picked ours). NVENCVT_AMPERE_ALL_DEC=1 registers
 // them all anyway.
+// Processes whose video stays with Apple's decoders, i.e. the integrated GPU's media engine: NVDEC_APPLE, a comma- or
+// space-separated list of process names (default: the Aerial wallpaper and the Displays pane, which plays the same movies; 0:
+// none). Those movies are 4K 10-bit HEVC at 240 pictures a second, one session per display. With its pictures in system memory
+// and untiled on the NVIDIA GPU, NVDEC puts out about 33 pictures a second of one such stream, nearly all of them late, and
+// keeps the NVIDIA GPU and its fans busy for a wallpaper; the integrated GPU's decoder keeps one stream in real time and three
+// at about 120 pictures a second each, with the NVIDIA GPU idle.
+static bool name_listed(const char *list, const char *me)
+{
+    const size_t n = strlen(me);
+    if (!n) return false;
+    for (const char *p = list; (p = strstr(p, me)); p += n)
+        if ((p == list || p[-1] == ',' || p[-1] == ' ') && (p[n] == 0 || p[n] == ',' || p[n] == ' ')) return true;
+    return false;
+}
+static bool apple_here(void)
+{
+    const char *e = getenv("NVDEC_APPLE"), *me = getprogname();
+    if (!me) return false;
+    return name_listed(e ? (strcmp(e, "0") ? e : "") : "WallpaperAerialsExtension,DisplaysExt", me);
+}
+
 static OSStatus register_decoders(int rating)
 {
     gDLog = getenv("NVENCVT_LOG") != NULL;
     if (!gDLog && access("/tmp/nvencvt.log", F_OK) == 0) { char p[64]; snprintf(p, sizeof p, "/tmp/nvencvt-%d.log", (int)getpid()); if ((gDLogF = fopen(p, "a"))) gDLog = true; }
     if (getenv("NVENCVT_NO_DEC")) return kVTCouldNotFindVideoDecoderErr;
+    if (apple_here()) { DLOG("decoders left to Apple's in %s (NVDEC_APPLE)", getprogname()); return kVTCouldNotFindVideoDecoderErr; }
     extern int gNvencvtGpu;   // vt/nvencvt.c: 1 Ada, 2 TU117 (GTX 1650: NVDEC 0xc4b0 has no AV1), 3 GA10x (RTX 30)
     const bool ampere = gNvencvtGpu == 3;
     const bool av1Vp9Only = ampere && !getenv("NVENCVT_AMPERE_ALL_DEC");
