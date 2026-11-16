@@ -315,9 +315,10 @@ int vp9dec_frame(Vp9Dec *d, const uint8_t *buf, size_t n)
               DRF_DEF(C9B0, _SEMAPHORE_D, _OPERATION, _RELEASE) | DRF_DEF(C9B0, _SEMAPHORE_D, _PAYLOAD_SIZE, _32BIT));
     const double t0 = now_ms();
     chan_submit(c);
-    while (sv[0] != val && now_ms() - t0 < 1000) { }
+    chan_wait_sem(c, sv, val, 3000);
     d->engine_ms = now_ms() - t0;
     if (sv[0] != val) { fprintf(stderr, "vp9dec: no completion (error notifier 0x%x)\n", chan_error(c)); return -1; }
+    chan_settled(c);
     const nvdec_status_s *st = d->status.cpu;
     d->err_status = st->error_status; d->ok_blocks = st->mbs_correctly_decoded;
     if (d->verbose)

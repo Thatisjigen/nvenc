@@ -2,7 +2,14 @@
 #include "channel.h"
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#include <pthread.h>
+#include <unistd.h>
+#include <sys/event.h>
+#include <errno.h>
+#include "ctrl/ctrl2080/ctrl2080perf.h"
 #include "class/cl0002.h"
 #include "class/clc56f.h"
 #include "class/clc361.h"
@@ -13,6 +20,21 @@
 #include "ctrl/ctrlc36f.h"
 
 #define CHK(x) do { NV_STATUS s_ = (x); if (s_) { fprintf(stderr, "chan: %s -> 0x%x\n", #x, s_); return s_; } } while (0)
+
+// RTX 5050 with the clocks left to the driver (BOOST=0 in nvrm610.conf): when they change under load the channel stops for over
+// a second, now and then for good, with no error notifier and no MMU fault, and neither a doorbell nor a new submit wakes it (H.264
+// in Chromium: a stop within 100 to 5000 frames; with the clocks held, none in 54 000). Held only while frames come: renewed for
+// 15 s at a time, so the clocks are free again 15 s after the last frame. NVDEC_NOBOOST=1 leaves it out.
+static void hold_clocks(Chan *c)
+{
+    if (!c->holdClocks) return;
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    if (t.tv_sec + 10 < c->heldUntil) return;
+    c->heldUntil = t.tv_sec + 15;
+    NV2080_CTRL_PERF_BOOST_PARAMS p = { .flags = NV2080_CTRL_PERF_BOOST_FLAGS_CMD_BOOST_TO_MAX, .duration = 15 };
+    NV_STATUS st = rm_ctrl(c->rm, c->rm->subdevice, NV2080_CTRL_CMD_PERF_BOOST, &p, sizeof p);
+    if (st) fprintf(stderr, "chan: holding the clocks -> 0x%x\n", st);
+}
 
 NV_STATUS chan_create(Rm *rm, Chan *c, NvU32 engineType, NvU32 objClass, void *objParams)
 {
@@ -29,6 +51,7 @@ NV_STATUS chan_create(Rm *rm, Chan *c, NvU32 engineType, NvU32 objClass, void *o
     CHK(rm_mem_alloc(rm, &c->gpfifo, c->entries * 8, 0x1000, true, true, true));
     CHK(rm_mem_alloc(rm, &c->push, 0x10000, 0x1000, true, true, true));
     c->cur = c->segStart = c->push.cpu;
+    c->holdClocks = objClass == 0xcfb0 && !getenv("NVDEC_NOBOOST");   // GB20x's NVDEC
 
     NV_CONTEXT_DMA_ALLOCATION_PARAMS cd = { .flags = DRF_DEF(OS03, _FLAGS, _MAPPING, _KERNEL) | DRF_DEF(OS03, _FLAGS, _HASH_TABLE, _DISABLE),
                                            .hMemory = c->notifier.hPhys, .offset = 0, .limit = c->notifier.size - 1 };
@@ -67,6 +90,9 @@ void chan_destroy(Chan *c)
 
 void chan_mthd(Chan *c, int subch, NvU32 mthd, int count, ...)
 {
+    // the push buffer is linear and what follows it is not ours: drop the commands, chan_submit then fails and the caller
+    // reports no completion, instead of the process writing over whatever is mapped next
+    if ((NvU8 *)(c->cur + 1 + count) > (NvU8 *)c->push.cpu + c->push.size) { c->overrun = true; return; }
     *c->cur++ = DRF_NUM(C56F, _DMA, _SEC_OP, NVC56F_DMA_SEC_OP_INC_METHOD) | DRF_NUM(C56F, _DMA, _METHOD_COUNT, count) |
                 DRF_NUM(C56F, _DMA, _METHOD_SUBCHANNEL, subch) | DRF_NUM(C56F, _DMA, _METHOD_ADDRESS, mthd >> 2);
     va_list ap; va_start(ap, count);
@@ -76,6 +102,12 @@ void chan_mthd(Chan *c, int subch, NvU32 mthd, int count, ...)
 
 NV_STATUS chan_submit(Chan *c)
 {
+    if (c->overrun) {
+        fprintf(stderr, "chan: push buffer full, nothing submitted\n");
+        c->overrun = false; c->cur = c->segStart;
+        return NV_ERR_INSUFFICIENT_RESOURCES;
+    }
+    hold_clocks(c);
     NvU64 va = c->push.gpu + (NvU64)((NvU8 *)c->segStart - (NvU8 *)c->push.cpu);
     NvU32 dwords = (NvU32)(c->cur - c->segStart);
     if (!dwords) return NV_OK;
@@ -83,19 +115,74 @@ NV_STATUS chan_submit(Chan *c)
     e[0] = DRF_NUM(C56F, _GP_ENTRY0, _GET, (NvU32)va >> 2);
     e[1] = DRF_NUM(C56F, _GP_ENTRY1, _GET_HI, (NvU32)(va >> 32)) | DRF_NUM(C56F, _GP_ENTRY1, _LENGTH, dwords);
     c->gpPut = (c->gpPut + 1) % c->entries;
-    c->segStart = c->cur;
+    c->segStart = c->cur; c->settled = false;
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
     ((volatile AmpereAControlGPFifo *)c->userd.cpu)->GPPut = c->gpPut;
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    (void)((volatile AmpereAControlGPFifo *)c->userd.cpu)->GPPut;   // USERD is in VRAM: the read flushes the write through BAR1
     *c->doorbell = c->token;
     return NV_OK;
 }
 
 bool chan_rewind(Chan *c)
 {
-    // the push buffer is linear: start over once the channel has fetched everything (GPGet == GPPut)
-    if (c->cur != c->segStart || chan_gpget(c) != c->gpPut) return false;
+    // the push buffer is linear: start over once the channel has fetched everything, GPGet == GPPut. GPGet alone is not enough:
+    // on the RTX 5050 it still reads 0 three seconds after the work completed, and the buffer filled up after 64 KiB of commands
+    // (170 H.264, 199 AV1 or 292 VP9 frames, then writes past its end). There the caller's word that its last submit completed
+    // stands in for it, but only once the buffer is well used: starting over after every frame, the same address again and again,
+    // left about one frame in a hundred without completion (no error notifier; the next one went through)
+    if (c->cur != c->segStart) return false;
+    if (chan_gpget(c) != c->gpPut && !(c->settled && chan_push_used(c) > c->push.size * 3 / 4)) return false;
     c->cur = c->segStart = c->push.cpu;
+    return true;
+}
+
+void chan_settled(Chan *c) { c->settled = true; }
+
+// The CPU has nothing to do while the engine works: polling all through it kept a core at 100 % during video (4K 10-bit HEVC on
+// the RTX 5050 takes 5 to 9 ms a picture; a third of the CPU cost of a frame). So sleep for most of the shortest time the
+// last pictures took, then in steps short enough not to hold the next one back (at most a sixteenth of the time spent so far).
+// The shortest and not the average: a picture that took a second must not put the next ones to sleep for long.
+// The sleeps keep their length whatever the caller's QoS. nanosleep takes the thread's timer leeway: on a utility or
+// background thread macOS stretches a 50 us sleep to tens of milliseconds (kern.timer_coalesce_*), so a decoder that waited
+// for its engine on such a thread (AVAssetReader, an export, a wallpaper extension) got about five 1080p pictures a second
+// while the engine finished each in 4 ms. A one-shot kqueue timer marked NOTE_CRITICAL is not coalesced. One kqueue per
+// thread that waits, closed when the thread ends; nanosleep if the kqueue cannot be had.
+static pthread_key_t g_kq_key;
+static bool g_kq_ok;
+static pthread_once_t g_kq_once = PTHREAD_ONCE_INIT;
+static void kq_close(void *v) { close((int)(intptr_t)v - 1); }
+static void kq_forget(void) { if (g_kq_ok) pthread_setspecific(g_kq_key, NULL); }   // a forked child has no kqueue of ours
+static void kq_key_init(void) { g_kq_ok = pthread_key_create(&g_kq_key, kq_close) == 0; if (g_kq_ok) pthread_atfork(NULL, NULL, kq_forget); }
+static void sleep_ns(uint64_t ns)
+{
+    pthread_once(&g_kq_once, kq_key_init);
+    int kq = g_kq_ok ? (int)(intptr_t)pthread_getspecific(g_kq_key) - 1 : -1;
+    if (kq < 0 && g_kq_ok && (kq = kqueue()) >= 0 && pthread_setspecific(g_kq_key, (void *)(intptr_t)(kq + 1))) { close(kq); kq = -1; }
+    if (kq >= 0) {
+        struct kevent64_s ev = { .ident = 1, .filter = EVFILT_TIMER, .flags = EV_ADD | EV_ONESHOT,
+                                 .fflags = NOTE_NSECONDS | NOTE_CRITICAL, .data = (int64_t)ns }, out;
+        if (kevent64(kq, &ev, 1, &out, 1, 0, NULL) >= 0 || errno == EINTR) return;   // a signal: the caller polls again
+    }
+    struct timespec ts = { (time_t)(ns / 1000000000), (long)(ns % 1000000000) };
+    nanosleep(&ts, NULL);
+}
+bool chan_wait_sem(Chan *c, const volatile NvU32 *sem, NvU32 val, unsigned timeout_ms)
+{
+    if (*sem == val) return true;
+    const uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW), limit = t0 + (uint64_t)timeout_ms * 1000000;
+    const uint64_t first = c->waitNs / 8 * 7;
+    if (first > 50000) sleep_ns(first);
+    uint64_t now;
+    for (;;) {
+        now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        if (*sem == val) break;
+        if (now >= limit) return false;
+        const uint64_t step = (now - t0) / 16;
+        sleep_ns(step > 50000 ? step : 50000);
+    }
+    const uint64_t took = now - t0, grown = c->waitNs + c->waitNs / 32;   // upwards slowly
+    c->waitNs = !c->waitNs || took < grown ? took : grown;
     return true;
 }
 

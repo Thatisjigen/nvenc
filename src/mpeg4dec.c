@@ -243,7 +243,7 @@ static int decode_vop(Mpeg4Dec *d, const uint8_t *vop, size_t len, const VopInfo
               DRF_DEF(C9B0, _SEMAPHORE_D, _OPERATION, _RELEASE) | DRF_DEF(C9B0, _SEMAPHORE_D, _PAYLOAD_SIZE, _32BIT));
     const double t0 = now_ms();
     chan_submit(c);
-    while (sv[0] != val && now_ms() - t0 < 1000) { }
+    chan_wait_sem(c, sv, val, 3000);
     d->engine_ms = now_ms() - t0;
     if (sv[0] != val) {
         NvU64 fa; NvU32 ft; char fs[32];
@@ -252,6 +252,7 @@ static int decode_vop(Mpeg4Dec *d, const uint8_t *vop, size_t len, const VopInfo
             (unsigned long long)fa, ft, fs, (unsigned long long)d->bs.gpu, (unsigned long long)d->setup.gpu, (unsigned long long)d->hist.gpu, (unsigned long long)d->scratch.gpu);
         return -1;
     }
+    chan_settled(c);
     const nvdec_status_s *st = d->status.cpu;
     d->mbs_ok = st->mbs_correctly_decoded; d->mbs_err = st->mbs_in_error; d->err_status = st->error_status;
     if (d->verbose)
