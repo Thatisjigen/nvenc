@@ -701,8 +701,13 @@ static int out_plane_jobs(DState *s, const OutJob *j, GpuPlaneJob g[2])
     }
     if (s->codec == CODEC_AV1) {
         Av1Dec *d = s->av1; const uint32_t b = (uint32_t)d->bps;
-        g[0] = (GpuPlaneJob){ .src = &d->luma[surf],   .width = w * b,              .rows = h,           .pitch = (uint32_t)d->pitch, .mode = GPU_UNTILE_NVENC_IN, .bpp = b };
-        g[1] = (GpuPlaneJob){ .src = &d->chroma[surf], .width = ((w + 1) & ~1u) * b, .rows = (h + 1) / 2, .pitch = (uint32_t)d->pitch, .mode = GPU_UNTILE_NVENC_IN, .bpp = b };
+        // Blackwell's layouts (d->bwgob, av1dec_open): luma in the GOB of its 1 or 2 bytes per texel; the interleaved chroma
+        // in the 16-bit GOB for 8-bit samples and in Turing's (the nvenc_in layout) for the 4-byte texels of 10-bit ones
+        const uint32_t my = d->bwgob ? GPU_UNTILE_NVDEC_BLACKWELL : GPU_UNTILE_NVENC_IN;
+        const bool cbw = d->bwgob && b == 1;
+        g[0] = (GpuPlaneJob){ .src = &d->luma[surf],   .width = w * b,              .rows = h,           .pitch = (uint32_t)d->pitch, .mode = my, .bpp = b };
+        g[1] = (GpuPlaneJob){ .src = &d->chroma[surf], .width = ((w + 1) & ~1u) * b, .rows = (h + 1) / 2, .pitch = (uint32_t)d->pitch,
+                              .mode = cbw ? GPU_UNTILE_NVDEC_BLACKWELL : GPU_UNTILE_NVENC_IN, .bpp = cbw ? 2 : b };
         return 1;
     }
     if (s->codec == kCMVideoCodecType_HEVC) {
@@ -1292,7 +1297,8 @@ static OSStatus register_decoders(int rating)
     extern int gNvencvtGpu;   // vt/nvencvt.c: 1 Ada, 2 TU117 (GTX 1650: NVDEC 0xc4b0 has no AV1), 3 GA10x (RTX 30)
     const bool ampere = gNvencvtGpu == 3;
     const bool av1Vp9Only = ampere && !getenv("NVENCVT_AMPERE_ALL_DEC");
-    // on GB20x (4, NVDEC 0xcfb0) H.264, HEVC, VP9 and 8-bit AV1 are checked (bit-exact on the RTX 5050); MPEG may need
+    // on GB20x (4, NVDEC 0xcfb0) H.264, HEVC, VP9 and 8-bit AV1 are checked (bit-exact on the RTX 5050); 10-bit AV1
+    // takes the setup NVIDIA's driver uses there (av1dec_open) and is not checked on this card yet; MPEG may need
     // what the others did there (method 0x4dc, a setup word past Ada's struct) or Blackwell's GOBs, so it stays unregistered
     const bool blackwell = gNvencvtGpu == 4;
     typedef OSStatus (*RegFn)(FourCharCode, CFDictionaryRef, void *);
@@ -1334,15 +1340,15 @@ static OSStatus register_decoders(int rating)
     // Ada's and Turing's class is known from the card (the PCI device ID), so RM is asked only for GA10x and for cards the
     // registry does not name - and RM answering 0 (no driver) means no AV1 decoder at all.
     const NvU32 nvcls = gNvencvtGpu == 1 ? 0xc9b0 : gNvencvtGpu == 2 ? 0xc4b0 : gNvencvtGpu == 4 ? 0xcfb0 : nvdec_class();   // 4: GB20x
-    const bool hasAv1 = nvcls == 0xc7b0 || nvcls == 0xc9b0 || nvcls == 0xcfb0;   // 0xcfb0: Blackwell, 8-bit only
+    const bool hasAv1 = nvcls == 0xc7b0 || nvcls == 0xc9b0 || nvcls == 0xcfb0;   // 0xcfb0: Blackwell
     DLOG("NVDEC class 0x%x%s", nvcls, hasAv1 ? " (AV1)" : " (no AV1)");
-    // GB20x decodes 8-bit AV1 only (av1dec.c refuses 10-bit there). VideoToolbox answers a client that asks what an AV1
-    // decoder can do with one fixed list for any registered hardware decoder, 8 and 10-bit alike; WebKit goes by that
-    // list and has no other AV1 decoder, so a page that then picks 10-bit AV1 gets "Media failed to decode". No AV1 in
-    // WebKit's GPU process on this GPU, then: its pages keep VP9, which decodes at both depths
-    // (NVENCVT_AV1DEC_WEBKIT=1 registers it there anyway).
+    // VideoToolbox answers a client that asks what an AV1 decoder can do with one fixed list for any registered hardware
+    // decoder, 8 and 10-bit alike; WebKit goes by that list and has no other AV1 decoder, so a page that picks 10-bit AV1
+    // gets "Media failed to decode" if the decoder cannot do it. On GB20x 10-bit AV1 is decoded but not yet checked against
+    // a 10-bit file, so WebKit's GPU process gets no AV1 decoder there until it is: its pages keep VP9, which decodes at
+    // both depths (NVENCVT_AV1DEC_WEBKIT=1 registers it there anyway).
     const bool webkitNoAv1 = blackwell && !strcmp(getprogname(), "com.apple.WebKit.GPU") && !getenv("NVENCVT_AV1DEC_WEBKIT");
-    if (webkitNoAv1 && hasAv1) DLOG("GB20x: no AV1 decoder in WebKit's GPU process (10-bit AV1 is refused on this GPU and WebKit cannot be told)");
+    if (webkitNoAv1 && hasAv1) DLOG("GB20x: no AV1 decoder in WebKit's GPU process (10-bit AV1 not yet checked on this GPU; NVENCVT_AV1DEC_WEBKIT=1 adds it)");
     if (!getenv("NVENCVT_NO_AV1DEC") && hasAv1 && !webkitNoAv1) {   // AV1 likewise (NVENCVT_NO_AV1DEC=1 leaves it out)
         const void *va[] = { CFSTR(DECODER_ID_AV1), CFSTR("NVDEC - AV1 - mickys/nvenc"), nr, kCFBooleanTrue };
         CFDictionaryRef ia = CFDictionaryCreate(NULL, k, va, 4, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);

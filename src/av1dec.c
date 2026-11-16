@@ -1,6 +1,7 @@
 // av1dec.c: see av1dec.h. Section numbers refer to the AV1 specification.
 #include "av1dec.h"
 #include "blocklinear.h"
+#include "nvdec_blackwell.h"
 #include "av1tables.h"
 #include "av1probs.h"
 #include <stdio.h>
@@ -30,11 +31,17 @@ int av1dec_open(Av1Dec *d, Rm *rm, unsigned maxW, unsigned maxH, int bit_depth)
     const NvU32 cls = rm_class(rm, RM_CLS_NVDEC);
     if (cls != 0xc7b0 && cls != 0xc9b0 && cls != 0xcfb0) { fprintf(stderr, "av1dec: this GPU's NVDEC (class 0x%x) has no AV1\n", cls); return -1; }
     d->blackwell = cls == 0xcfb0;
-    // on the RTX 5050 10-bit key frames decode bit-exact and every inter frame comes out wrong, with no error. HEVC
-    // and VP9 needed a 3 in a reserved field for 10-bit there; no single field of the AV1 setup (nor its extension, the
-    // reference entries, strides or further methods) did it, so 10-bit AV1 is refused rather than shown wrong
-    if (d->blackwell && bit_depth > 8) { fprintf(stderr, "av1dec: 10-bit AV1 is not supported on Blackwell yet\n"); return -1; }
+    // Blackwell, 10-bit: with the setup as Ada's (planes in Turing's layout, no surface format) key frames decode bit-exact
+    // and every inter frame comes out wrong, with no error. What NVIDIA's driver sets there (nvdec_blackwell.h) is the
+    // surface format code and the planes' GOB kinds in reserved_stat, 0xffff in reserved12 and the word of block units
+    // after the structure; with the kinds the engine writes and reads Blackwell's layouts: luma in the 16-bit GOB and the
+    // 4-byte chroma texels in Turing's. So a 10-bit session takes all of it. An 8-bit one keeps the setup it was checked
+    // with (Turing's layout, block units 0x10). NVDEC_AV1_GOB=blackwell or turing picks one of the two for both depths.
     d->bit_depth = bit_depth; d->bps = bit_depth > 8 ? 2 : 1;
+    if (d->blackwell && nvdec_gob_blackwell) {
+        const char *g = getenv("NVDEC_AV1_GOB");
+        d->bwgob = g ? !strcmp(g, "blackwell") : bit_depth > 8;
+    }
     d->pitch = (size_t)d->maxW * (size_t)d->bps;
     for (int i = 0; i < 8; i++) d->ref[i] = -1;
     for (int i = 0; i < AV1_SURFACES; i++) d->twin[i] = -1;
@@ -88,14 +95,21 @@ void av1dec_release(Av1Dec *d, int surf) { if (surf >= 0 && surf < AV1_SURFACES)
 void av1dec_read_nv12(Av1Dec *d, int surf, uint8_t *y, size_t ystride, uint8_t *uv, size_t uvstride, unsigned w, unsigned h)
 {
     const size_t b = (size_t)d->bps;
+    if (d->bwgob) {   // a plane's layout follows its bytes per texel: luma b, the interleaved chroma 2b (nvdec_untile_plane)
+        nvdec_untile_plane(y, ystride, d->luma[surf].cpu, w * b, h, d->pitch, (unsigned)b);
+        nvdec_untile_plane(uv, uvstride, d->chroma[surf].cpu, ((w + 1) & ~1u) * b, (h + 1) / 2, d->pitch, 2 * (unsigned)b);
+        return;
+    }
     nvenc_in_untile_plane(y, ystride, d->luma[surf].cpu, w * b, h, d->pitch);
     nvenc_in_untile_plane(uv, uvstride, d->chroma[surf].cpu, ((w + 1) & ~1u) * b, (h + 1) / 2, d->pitch);
 }
 
-static unsigned sample(const uint8_t *p, size_t x, size_t y, size_t pitch, int bps, int shift)
+// texel: the plane's bytes per texel, which picks its layout when the engine writes Blackwell's (bwgob)
+static unsigned sample(const uint8_t *p, bool bwgob, unsigned texel, size_t x, size_t y, size_t pitch, int bps, int shift)
 {
-    if (bps == 1) return p[nvenc_in_offset(x, y, pitch)];
-    const size_t o = nvenc_in_offset(2 * x, y, pitch);
+    const size_t bx = bps == 1 ? x : 2 * x;
+    const size_t o = bwgob ? nvdec_offset(bx, y, pitch, texel) : nvenc_in_offset(bx, y, pitch);
+    if (bps == 1) return p[o];
     return (unsigned)(p[o] | p[o + 1] << 8) >> shift;
 }
 
@@ -106,10 +120,11 @@ void av1dec_read_i420(Av1Dec *d, int surf, uint8_t *dst, unsigned w, unsigned h)
     const int b = d->bps, sh = b == 2 ? 16 - d->bit_depth : 0;
     #define PUT(i, v) do { if (b == 1) dst[i] = (uint8_t)(v); else { dst[2 * (i)] = (uint8_t)(v); dst[2 * (i) + 1] = (uint8_t)((v) >> 8); } } while (0)
     const size_t U = (size_t)w * h, V = U + (size_t)cw * ch;
-    for (unsigned y = 0; y < h; y++) for (unsigned x = 0; x < w; x++) PUT((size_t)y * w + x, sample(L, x, y, d->pitch, b, sh));
+    const unsigned tl = (unsigned)b, tc = 2 * (unsigned)b;
+    for (unsigned y = 0; y < h; y++) for (unsigned x = 0; x < w; x++) PUT((size_t)y * w + x, sample(L, d->bwgob, tl, x, y, d->pitch, b, sh));
     for (unsigned y = 0; y < ch; y++) for (unsigned x = 0; x < cw; x++) {
-        PUT(U + (size_t)y * cw + x, sample(C, 2 * x, y, d->pitch, b, sh));
-        PUT(V + (size_t)y * cw + x, sample(C, 2 * x + 1, y, d->pitch, b, sh));
+        PUT(U + (size_t)y * cw + x, sample(C, d->bwgob, tc, 2 * x, y, d->pitch, b, sh));
+        PUT(V + (size_t)y * cw + x, sample(C, d->bwgob, tc, 2 * x + 1, y, d->pitch, b, sh));
     }
     #undef PUT
 }
@@ -547,9 +562,15 @@ static int decode_frame(Av1Dec *d)
         chan_mthd(c, 0, NVC9B0_SET_DISPLAY_BUF_CHROMA_OFFSET, 1, hi(d->chroma[disp].gpu));
     }
     #undef BUF
-    if (d->blackwell) {   // method 0x4dc, and the word 0x10 just past Ada's struct + 8, as for HEVC and VP9
-        chan_mthd(c, 0, 0x4dc, 1, hi(d->bw4dc.gpu));
-        ((NvU32 *)d->setup.cpu)[(sizeof(nvdec_av1_pic_s) + 8) / 4] = 0x10;
+    if (d->blackwell) {   // method 0x4dc, and the word of block units just past Ada's struct + 8, as for HEVC and VP9
+        chan_mthd(c, 0, NVCFB0_SET_INTER_SCRATCH_OFFSET, 1, hi(d->bw4dc.gpu));
+        NvU32 *units = &((NvU32 *)d->setup.cpu)[(sizeof(nvdec_av1_pic_s) + 8) / 4];
+        if (d->bwgob || d->bit_depth > 8) {   // what NVIDIA's driver sets on class 0xcfb0 (nvdec_blackwell.h)
+            nvdec_av1_pic_s *bw = d->setup.cpu;
+            bw->reserved12 = 0xffff;
+            bw->reserved_stat = (d->bwgob ? NVCFB0_PLANE_KINDS(d->bps) : 0u) | NVCFB0_SURFACE_FORMAT(d->bit_depth) << 4;
+            *units = NVCFB0_BLK_UNITS(f->upscaled_width);
+        } else *units = 0x10;   // 8-bit in Turing's layout: the value it was checked with
     }
     chan_mthd(c, 0, NVC9B0_EXECUTE, 1, 0u);
     const NvU32 val = ++d->semval; volatile NvU32 *sv = d->sem.cpu;
