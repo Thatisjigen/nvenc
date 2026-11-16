@@ -17,9 +17,9 @@ tar -C vendor -chf - webkit-spi | ssh "$G" 'tar -xf - -C ~/nvenc-dev/inc'
 VER=$(git describe --tags --always --dirty 2>/dev/null || echo dev)   # the version in the encoder names (vt/nvencvt.c)
 tar -cf - src tools trace vt | ssh "$G" "cd ~/nvenc-dev && rm -rf src tools trace vt && tar -xf - && for t in $tools; do
   if [ -f vt/\$t.c ]; then
-    clang -O2 -Wall -dynamiclib -DNVENC_VERSION='\"$VER\"' -o lib\$t.dylib vt/\$t.c \$(ls vt/\${t}_*.c 2>/dev/null) src/*.c -I src -I inc/webkit-spi \
+    clang -O2 -Wall -fobjc-arc -dynamiclib -DNVENC_VERSION='\"$VER\"' -o lib\$t.dylib vt/\$t.c \$(ls vt/\${t}_*.c vt/\${t}_*.m 2>/dev/null) src/*.c -I src -I inc/webkit-spi \
       -I inc/ogkm/src/common/sdk/nvidia/inc -I inc/ogkm/src/nvidia/arch/nvalloc/unix/include -I inc/ogd/classes/video \
-      -framework IOKit -framework CoreFoundation -framework CoreMedia -framework CoreVideo -framework VideoToolbox -framework Accelerate -framework IOSurface 2>&1 | grep -E 'error|warning'
+      -framework IOKit -framework CoreFoundation -framework CoreMedia -framework CoreVideo -framework VideoToolbox -framework Accelerate -framework IOSurface -framework Metal -framework Foundation 2>&1 | grep -E 'error|warning'
   elif [ -f trace/\$t.c ]; then
     clang -O2 -Wall -dynamiclib -o \$t.dylib trace/\$t.c \
       -I inc/ogkm/src/common/sdk/nvidia/inc -I inc/ogkm/src/nvidia/arch/nvalloc/unix/include -framework IOKit -framework CoreFoundation \

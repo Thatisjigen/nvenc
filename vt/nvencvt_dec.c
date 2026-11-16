@@ -11,6 +11,7 @@
 #include "hevcdec.h"
 #include "mpeg2dec.h"
 #include "mpeg4dec.h"
+#include "gpuntile.h"
 #include <CoreFoundation/CoreFoundation.h>
 #include <CoreMedia/CoreMedia.h>
 #include <CoreVideo/CoreVideo.h>
@@ -83,12 +84,12 @@ typedef struct {
     CVPixelBufferPoolRef ownPool;   // our own pool, made with the client's destination attributes (see set_output)
     CFDictionaryRef colour;         // colour attachments for the output (from the format description)
     unsigned frames, errors;
-    double tIn, tEngine, tPool, tCopy, tEmit, tOut, tLast;   // ms: inside decodeFrame, engine wait, pool, untile, emit; between calls
+    double tIn, tEngine, tPool, tCopy, tEmit, tOut, tLast, tGpu;   // ms: inside decodeFrame, engine wait, pool, untile, emit; between calls; untile on the GPU
     uint8_t *tmp; size_t tmpCap;    // a non-contiguous sample, flattened
     bool qosOff;                    // real-time playback beyond the engine (qos_hevc, its state in the group)
     unsigned W, H; int depth, cf, topTid; uint64_t streamId;   // HEVC: what a decoder of its own would be made with
     // asynchronous output (T8.09): pictures waiting for the output thread (copy, emit, release), in decode order
-    struct OutJob { VTVideoDecoderFrame frame; OSStatus res; VTDecodeInfoFlags fl; CVPixelBufferRef pb; int surf, rel; unsigned w, h, cx, cy, usCopy, usEmit; } q[4];
+    struct OutJob { VTVideoDecoderFrame frame; OSStatus res; VTDecodeInfoFlags fl; CVPixelBufferRef pb; int surf, rel; unsigned w, h, cx, cy, usCopy, usEmit, usGpu; } q[4];
     unsigned qh, qt; bool async, thrOn, stop; pthread_t thr; pthread_cond_t cv;
 } DState;
 typedef struct OutJob OutJob;
@@ -215,6 +216,26 @@ static bool share_here(void)
     }
     return on == 1;
 }
+// Where the decoded planes are untiled: on the NVIDIA GPU that decoded them, in every process, never on the integrated one. The
+// integrated GPU composes the panel and the displays behind it, and the untile is video work: at the start of a screen saver the
+// wallpaper opened a decoder per display and per sample reader and untiled every picture on the integrated GPU, one command buffer
+// each, over up to 16 surfaces of 25 MB per decoder wrapped for that GPU, while WindowServer composed three displays on it: the Iris
+// Xe hung in the wallpaper's context within half a minute, again after every restart, until IOAccel refused the wallpaper's
+// submissions. A browser playing 4K video puts the same load there. When the NVIDIA GPU is not offered to the process, or a command
+// buffer fails there, the CPU untiles (a fraction of one core; a shared decoder copies each picture once for all displays).
+// NVENCVT_GPU=nvidia, =intel (or 1) or =0 (the CPU) decides for every process; NVENCVT_NOGPU=1 keeps both GPUs out.
+static int untile_gpu(void)
+{
+    static int dev = -1;
+    if (dev < 0) {
+        const char *e = getenv("NVENCVT_GPU");
+        dev = !e ? GPU_UNTILE_DEV_NVIDIA
+            : !strcmp(e, "0") ? 0 : !strcmp(e, "nvidia") ? GPU_UNTILE_DEV_NVIDIA : GPU_UNTILE_DEV_INTEL;
+        if (dev) gpu_untile_choose(dev);
+        DLOG("untile on %s", dev == GPU_UNTILE_DEV_NVIDIA ? "the NVIDIA GPU" : dev ? "the integrated GPU" : "the CPU");
+    }
+    return dev;
+}
 // a group is open to other sessions, and keeps the pictures for them, for its first moments and while it has more than one session;
 // never while its one session decodes synchronously
 static bool group_open(const HevcGroup *g, double now) { return share_here() && !g->sync && (g->refs > 1 || now - g->born < GROUP_OPEN_MS); }
@@ -309,8 +330,8 @@ static OSStatus b_invalidate(CMBaseObjectRef o)
     if (s->fmt) { CFRelease(s->fmt); s->fmt = NULL; }
     if (s->ownPool) { CVPixelBufferPoolRelease(s->ownPool); s->ownPool = NULL; }
     if (s->colour) { CFRelease(s->colour); s->colour = NULL; }
-    if (s->frames) DLOG("per frame: decodeFrame %.2f ms (engine %.2f, pool %.2f, copy %.2f, emit %.2f), outside %.2f ms",
-         s->tIn / s->frames, s->tEngine / s->frames, s->tPool / s->frames, s->tCopy / s->frames, s->tEmit / s->frames, s->tOut / s->frames);
+    if (s->frames) DLOG("per frame: decodeFrame %.2f ms (engine %.2f, pool %.2f, copy %.2f of which GPU %.2f, emit %.2f), outside %.2f ms",
+         s->tIn / s->frames, s->tEngine / s->frames, s->tPool / s->frames, s->tCopy / s->frames, s->tGpu / s->frames, s->tEmit / s->frames, s->tOut / s->frames);
     DLOG("invalidate after %u frames, %u errors", s->frames, s->errors);
     pthread_mutex_unlock(&s->lock);
     return noErr;
@@ -664,11 +685,75 @@ static void out_drain_for_group(DState *s);
 // asynchronous decompression (kVTDecodeFrame_EnableAsynchronousDecompression: AVFoundation) get that from an output
 // thread while the engine decodes the next picture; synchronous ones (ffmpeg) inside decodeFrame. Every frame of an
 // asynchronous run goes through the queue (errors and dropped frames too), so they come out in decode order.
+extern int nvdec_gob_blackwell;   // blocklinear.c: H.264 on NVDEC 0xcfb0 writes the Blackwell GOBs, else the nvenc_in layout
+
+// Fill the integrated-GPU untile jobs (luma = g[0], chroma = g[1]) for the current surface, mirroring EXACTLY the plane
+// parameters each decoder's read_nv12 passes to nvenc_in_untile_plane / nvdec_untile_plane (widths in bytes). Returns 1
+// when the surface can be untiled on the GPU, or 0 for the cropped-left/top case (rare), which stays on the CPU path.
+static int out_plane_jobs(DState *s, const OutJob *j, GpuPlaneJob g[2])
+{
+    const unsigned w = j->w, h = j->h; const int surf = j->surf;
+    if (s->codec == CODEC_VP9) {
+        Vp9Dec *d = s->vp9; const uint32_t b = (uint32_t)d->bps;
+        g[0] = (GpuPlaneJob){ .src = &d->luma[surf],   .width = w * b,              .rows = h,           .pitch = (uint32_t)d->pitch, .mode = GPU_UNTILE_NVENC_IN, .bpp = b };
+        g[1] = (GpuPlaneJob){ .src = &d->chroma[surf], .width = ((w + 1) & ~1u) * b, .rows = (h + 1) / 2, .pitch = (uint32_t)d->pitch, .mode = GPU_UNTILE_NVENC_IN, .bpp = b };
+        return 1;
+    }
+    if (s->codec == CODEC_AV1) {
+        Av1Dec *d = s->av1; const uint32_t b = (uint32_t)d->bps;
+        g[0] = (GpuPlaneJob){ .src = &d->luma[surf],   .width = w * b,              .rows = h,           .pitch = (uint32_t)d->pitch, .mode = GPU_UNTILE_NVENC_IN, .bpp = b };
+        g[1] = (GpuPlaneJob){ .src = &d->chroma[surf], .width = ((w + 1) & ~1u) * b, .rows = (h + 1) / 2, .pitch = (uint32_t)d->pitch, .mode = GPU_UNTILE_NVENC_IN, .bpp = b };
+        return 1;
+    }
+    if (s->codec == kCMVideoCodecType_HEVC) {
+        HevcDec *d = s->hevc; if (j->cx || j->cy) return 0;
+        const uint32_t b = (uint32_t)d->bps, cp = d->chroma_format == 3 ? 2 * (uint32_t)d->pitch : (uint32_t)d->pitch;
+        const uint32_t cw = d->chroma_format == 3 ? w : (w + 1) / 2, ch = d->chroma_format == 3 ? h : (h + 1) / 2;
+        g[0] = (GpuPlaneJob){ .src = &d->luma[surf],   .width = w * b,       .rows = h,  .pitch = (uint32_t)d->pitch, .mode = GPU_UNTILE_NVENC_IN, .bpp = b };
+        g[1] = (GpuPlaneJob){ .src = &d->chroma[surf], .width = 2 * cw * b,  .rows = ch, .pitch = cp,                 .mode = GPU_UNTILE_NVENC_IN, .bpp = b };
+        return 1;
+    }
+    if (is_mpeg12(s->codec)) {
+        Mpeg2Dec *d = s->m2;
+        g[0] = (GpuPlaneJob){ .src = &d->luma[surf],   .width = w, .rows = h,           .pitch = (uint32_t)d->pitch, .mode = GPU_UNTILE_NVENC_IN, .bpp = 1 };
+        g[1] = (GpuPlaneJob){ .src = &d->chroma[surf], .width = w, .rows = (h + 1) / 2, .pitch = (uint32_t)d->pitch, .mode = GPU_UNTILE_NVENC_IN, .bpp = 1 };
+        return 1;
+    }
+    if (s->codec == kCMVideoCodecType_MPEG4Video) {
+        Mpeg4Dec *d = s->m4;
+        g[0] = (GpuPlaneJob){ .src = &d->luma[surf],   .width = w, .rows = h,           .pitch = (uint32_t)d->pitch, .mode = GPU_UNTILE_NVENC_IN, .bpp = 1 };
+        g[1] = (GpuPlaneJob){ .src = &d->chroma[surf], .width = w, .rows = (h + 1) / 2, .pitch = (uint32_t)d->pitch, .mode = GPU_UNTILE_NVENC_IN, .bpp = 1 };
+        return 1;
+    }
+    H264Dec *d = &s->dec; if (d->x0[surf] || d->y0[surf]) return 0;   // H.264 (nvdec layout: Blackwell GOBs on 0xcfb0)
+    const uint32_t mode = nvdec_gob_blackwell ? GPU_UNTILE_NVDEC_BLACKWELL : GPU_UNTILE_NVENC_IN;
+    g[0] = (GpuPlaneJob){ .src = &d->luma[surf],   .width = w, .rows = h,     .pitch = (uint32_t)d->pitch, .mode = mode, .bpp = 1 };
+    g[1] = (GpuPlaneJob){ .src = &d->chroma[surf], .width = w, .rows = h / 2, .pitch = (uint32_t)d->pitch, .mode = mode, .bpp = 2 };
+    return 1;
+}
+
 static void out_copy(DState *s, OutJob *j)
 {
     if (!j->pb || j->surf < 0 || j->res) return;
     const double tc = nowms();
     CVPixelBufferRef pb = j->pb;
+    // Untile straight into the output IOSurface on a GPU (no CPU untile, no CPU copy) when this process uses one (untile_gpu),
+    // it is ready and the surface is not cropped on the left/top; otherwise fall through to the CPU untile below (identical result).
+    IOSurfaceRef ios;
+    GpuPlaneJob g[2];
+    if (untile_gpu() && gpu_untile_ready() && (ios = CVPixelBufferGetIOSurface(pb)) && out_plane_jobs(s, j, g)) {
+        // Lock the pixel buffer around the GPU untile, exactly as the CPU path below does: it brings the IOSurface into
+        // the shared linear state the GPU writes and bumps its seed on unlock, so a consumer on a different GPU (the one
+        // that drives the display) sees the new frame instead of a stale surface (green). Decline -> CPU untile.
+        CVPixelBufferLockBaseAddress(pb, 0);
+        int grc = gpu_untile_nv12((void *)ios, &g[0], &g[1]);
+        CVPixelBufferUnlockBaseAddress(pb, 0);
+        if (grc == 0) {
+            if (s->colour && !getenv("NVDEC_NOCOLOUR")) CVBufferSetAttachments(pb, s->colour, kCVAttachmentMode_ShouldPropagate);
+            j->usCopy = (unsigned)((nowms() - tc) * 1000); j->usGpu = (unsigned)(gpu_untile_last_gpu_ms() * 1000);
+            return;
+        }
+    }
     CVPixelBufferLockBaseAddress(pb, 0);
     uint8_t *y = CVPixelBufferGetBaseAddressOfPlane(pb, 0), *uv = CVPixelBufferGetBaseAddressOfPlane(pb, 1);
     const size_t ys = CVPixelBufferGetBytesPerRowOfPlane(pb, 0), uvs = CVPixelBufferGetBytesPerRowOfPlane(pb, 1);
@@ -715,7 +800,7 @@ static void *out_thread(void *arg)
         out_copy(s, &j); out_emit(s, &j);
         pthread_mutex_lock(&s->lock);
         out_release(s, &j);
-        if (copied) s->tCopy += j.usCopy / 1000.0;
+        if (copied) { s->tCopy += j.usCopy / 1000.0; s->tGpu += j.usGpu / 1000.0; }
         s->tEmit += j.usEmit / 1000.0;
         s->qh++;
         pthread_cond_broadcast(&s->cv);
@@ -742,7 +827,7 @@ static void out_deliver(DState *s, OutJob *j)
     out_drain(s);
     const bool copied = j->pb && j->surf >= 0 && !j->res;
     out_copy(s, j); out_release(s, j); out_emit(s, j);
-    if (copied) s->tCopy += j->usCopy / 1000.0;
+    if (copied) { s->tCopy += j->usCopy / 1000.0; s->tGpu += j->usGpu / 1000.0; }
     s->tEmit += j->usEmit / 1000.0;
 }
 
@@ -965,7 +1050,7 @@ again:
         pthread_mutex_unlock(&gGroupLock);
         const double tWork = nowms();   // what counts as busy: not the wait for the others
         OSStatus res = decode_hevc_picture(s, p, len, &j);
-        if (j.pb && j.surf >= 0 && !res) { out_copy(s, &j); s->tCopy += j.usCopy / 1000.0; }   // whole before anyone else gets it
+        if (j.pb && j.surf >= 0 && !res) { out_copy(s, &j); s->tCopy += j.usCopy / 1000.0; s->tGpu += j.usGpu / 1000.0; }   // whole before anyone else gets it
         if (j.rel >= 0) { hevcdec_release(s->hevc, j.rel); j.rel = -1; }
         j.surf = -1;
         pthread_mutex_lock(&gGroupLock);
